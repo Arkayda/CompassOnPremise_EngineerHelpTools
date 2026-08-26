@@ -91,8 +91,11 @@ LOG_ERROR_PATTERNS = [
 GROUPS = [
     ("config", "Конфигурация (сверка с values)"),
     ("infra", "Инфраструктура"),
+    ("requirements", "Требования к серверу"),
     ("services", "Сервисы swarm"),
     ("http", "HTTP-доступность"),
+    ("external", "Внешние зависимости"),
+    ("functional", "Функциональные смоук-тесты"),
     ("db", "Базы данных и поиск"),
     ("kafka", "Kafka (SIEM)"),
     ("logs", "Ошибки в логах"),
@@ -106,13 +109,15 @@ RUN_ONCE_SERVICE_PREFIXES = ("default-file",)
 
 parser = create_parser(
     description="Диагностика установленного окружения Compass On-premise: конфигурация, сервисы, базы, HTTP, логи, бэкапы.",
-    usage="python3 diagnose.py [-e ENVIRONMENT] [-v VALUES] [--installer-dir PATH] [--only GROUPS] [--since PERIOD] [--json] [--no-color]",
+    usage="python3 diagnose.py [-e ENVIRONMENT] [-v VALUES] [--installer-dir PATH] [--only GROUPS] [--since PERIOD] [--functional] [--json] [--no-color]",
     epilog="Примеры:\n"
            "  python3 diagnose.py -e production -v compass\n"
            "  python3 diagnose.py -e production --only services,db,logs --since 24h\n"
+           "  python3 diagnose.py --functional --only functional\n"
            "  python3 diagnose.py --json > /tmp/diagnose.json\n"
            "\n"
            "Группы проверок: " + ", ".join([group[0] for group in GROUPS]) + ".\n"
+           "Группа functional запускается только с флагом --functional.\n"
            "Код завершения: 0 — критических проблем нет, 1 — есть FAIL.",
 )
 parser.add_argument('-e', '--environment', required=False, default="production", type=str,
@@ -129,6 +134,8 @@ parser.add_argument("--http-timeout", required=False, default=DEFAULT_HTTP_TIMEO
                     help="Таймаут HTTP-проверок в секундах")
 parser.add_argument("--log-tail", required=False, default=LOG_TAIL_LIMIT, type=int,
                     help="Сколько строк лога сервиса просматривать")
+parser.add_argument("--functional", required=False, action="store_true",
+                    help="Запустить функциональные смоук-тесты (группа functional: автоудаление файлов, крон, поиск)")
 parser.add_argument("--json", required=False, action="store_true",
                     help="Вывести отчёт в формате JSON (для мониторинга)")
 parser.add_argument("--no-color", required=False, action="store_true",
@@ -1051,6 +1058,415 @@ def find_containers(ctx, stack, name_substring):
     ]
 
 
+# ---ПРОВЕРКИ: ТРЕБОВАНИЯ К СЕРВЕРУ---#
+
+# минимальные требования из документации (doc-onpremise.getcompass.ru/requirements.html)
+MIN_REQUIRED_CPU = 12
+MIN_REQUIRED_RAM_GB = 20
+MIN_REQUIRED_DISK_GB = 200
+
+
+@check("requirements", "CPU/RAM/диск (мин. требования)")
+def check_requirements_resources(ctx):
+    problems = []
+    notes = []
+
+    cpu_count = os.cpu_count() or 0
+    if cpu_count and cpu_count < MIN_REQUIRED_CPU:
+        problems.append("CPU %d ядер < %d" % (cpu_count, MIN_REQUIRED_CPU))
+
+    try:
+        with open("/proc/meminfo") as meminfo_file:
+            for line in meminfo_file:
+                if line.startswith("MemTotal:"):
+                    ram_gb = int(line.split()[1]) / 1024 ** 2
+                    if ram_gb < MIN_REQUIRED_RAM_GB:
+                        problems.append("RAM %.0f ГБ < %d ГБ" % (ram_gb, MIN_REQUIRED_RAM_GB))
+                    break
+    except OSError:
+        notes.append("размер памяти не определился (/proc/meminfo недоступен)")
+
+    root_mount_path = ctx.value("root_mount_path")
+    if root_mount_path and Path(root_mount_path).exists():
+        rc, out, _ = run_cmd(["df", "-BG", "-P", root_mount_path], timeout=30)
+        if rc == 0:
+            fields = out.splitlines()[-1].split()
+            if len(fields) >= 2:
+                try:
+                    disk_gb = int(fields[1].rstrip("G"))
+                    if disk_gb < MIN_REQUIRED_DISK_GB:
+                        problems.append("диск %s: %d ГБ < %d ГБ" % (root_mount_path, disk_gb, MIN_REQUIRED_DISK_GB))
+                except ValueError:
+                    notes.append("размер диска не распарсился: %s" % fields[1])
+    else:
+        notes.append("root_mount_path неизвестен или не существует")
+
+    if problems:
+        ctx.record("requirements", "CPU/RAM/диск (мин. требования)", STATUS_WARN,
+                   "%s — сервисы (особенно php_monolith) могут не подняться или работать нестабильно; "
+                   "тестовые стенды могут быть меньше намеренно. "
+                   "Заодно замерьте диск: fio --name=t --filename=/tmp/fio --size=1G --rw=randread --bs=4k --direct=1 "
+                   "(нужно ~1200 случайных IOPS на чтение)" % "; ".join(problems))
+        return
+
+    ctx.record("requirements", "CPU/RAM/диск (мин. требования)", STATUS_OK,
+               "CPU %s, %s%s" % (
+                   cpu_count or "?",
+                   "требованиям соответствует",
+                   ("; %s" % "; ".join(notes)) if notes else "",
+               ))
+
+
+@check("requirements", "порты входящих соединений")
+def check_requirements_ports(ctx):
+    if not ctx.values_loaded:
+        ctx.record("requirements", "порты входящих соединений", STATUS_SKIP, "values не загружены")
+        return
+
+    # ожидаемые слушающие порты собираем из values
+    expected_tcp = []
+
+    def add_tcp(port, description):
+        if port:
+            try:
+                expected_tcp.append((int(port), description))
+            except (TypeError, ValueError):
+                pass
+
+    add_tcp(ctx.value("projects.monolith.service.nginx.external_https_port"), "главный nginx")
+    add_tcp(ctx.value("projects.monolith.service.nginx.external_http_port"), "главный nginx (http)")
+
+    gateway_id = ctx.value("api_gateway_id", "gateway-1")
+    add_tcp(ctx.value("projects.api_gateway.%s.service.go_api_gateway.external_https_port" % gateway_id),
+            "api_gateway")
+
+    add_tcp(ctx.value("projects.auth.service.go_auth.external_grpc_port"), "go-auth grpc")
+    add_tcp(ctx.value("projects.join_web.service.join_web.external_port"), "join_web")
+    add_tcp(ctx.value("projects.jitsi_web.service.jitsi_web.external_port"), "jitsi_web")
+    if ctx.value("projects.outlook_add_in.is_enabled"):
+        add_tcp(ctx.value("projects.outlook_add_in.service.external_port"), "outlook_add_in")
+    if ctx.value("siem.enabled_driver") == "kafka":
+        add_tcp(ctx.value("projects.kafka.service.kafka.external_port"), "kafka")
+
+    for domino_config in (ctx.value("projects.domino", {}) or {}).values():
+        if not isinstance(domino_config, dict):
+            continue
+        add_tcp(domino_config.get("service", {}).get("manticore", {}).get("external_port"),
+                "manticore (поиск)")
+        add_tcp(domino_config.get("go_database_controller_port"), "go-database-controller")
+
+    expected_udp = []
+    turn_note = ""
+    jvb_media_port = ctx.value("projects.jitsi.service.jvb.media_port")
+    if jvb_media_port:
+        expected_udp.append((int(jvb_media_port), "медиа-трафик звонков (jvb)"))
+
+    # TURN: внешний сервер getCompass проверять локально не нужно — только свой
+    turn_host = ctx.value("projects.jitsi.service.turn.host")
+    turn_is_local = False
+    if turn_host:
+        try:
+            turn_is_local = any(
+                addr[4][0] in (socket.gethostbyname_ex(turn_host)[2] or [""])
+                for addr in socket.getaddrinfo(socket.gethostname(), None)
+            ) or turn_host in ("localhost", "127.0.0.1")
+        except Exception:
+            turn_is_local = False
+    if turn_host and turn_is_local:
+        expected_udp.append((3478, "TURN-сервер"))
+    elif turn_host:
+        turn_note = "TURN внешний (%s) — локально не проверяем" % turn_host
+
+    # фактические слушающие порты
+    def listening_ports(protocol_flag):
+        rc, out, _ = run_cmd(["ss", "-%sn" % protocol_flag], timeout=30)
+        if rc != 0:
+            return None
+        ports = set()
+        for line in out.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            local = fields[3]
+            try:
+                ports.add(int(local.rsplit(":", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        return ports
+
+    tcp_ports = listening_ports("tl")
+    udp_ports = listening_ports("ul")
+    if tcp_ports is None:
+        ctx.record("requirements", "порты входящих соединений", STATUS_SKIP,
+                   "не удалось получить список портов (ss отсутствует?)")
+        return
+
+    missing = []
+    for port, description in expected_tcp:
+        if port not in tcp_ports:
+            missing.append("%d/tcp (%s)" % (port, description))
+    for port, description in expected_udp:
+        if udp_ports is None or port not in udp_ports:
+            missing.append("%d/udp (%s)" % (port, description))
+
+    if missing:
+        ctx.record("requirements", "порты входящих соединений", STATUS_WARN,
+                   "не слушаются: %s — сервис не запущен или порт не опубликован "
+                   "(клиентский firewall проверяйте отдельно)" % ", ".join(missing))
+        return
+
+    total = len(expected_tcp) + len(expected_udp)
+    ctx.record("requirements", "порты входящих соединений", STATUS_OK,
+               "все ожидаемые порты (%d) слушаются%s" % (total, ("; %s" % turn_note) if turn_note else ""))
+
+
+# ---ПРОВЕРКИ: ВНЕШНИЕ ЗАВИСИМОСТИ---#
+
+# проверка доступности внешнего http-сервиса с валидацией TLS
+# (для getcompass-сервисов сертификаты публичные — ловим и подмену прокси, и отсутствие CA)
+def external_http_check(ctx, name, url):
+    proxy_note = ""
+    proxy_host = ctx.value("proxy.host")
+    proxy_port = ctx.value("proxy.port") or 0
+    if proxy_host and proxy_host not in ("0.0.0.0", "") and int(proxy_port or 0) > 0:
+        proxy_note = " (в values настроен прокси %s:%s — проверяйте доступ через него)" % (proxy_host, proxy_port)
+
+    try:
+        response = requests.get(url, verify=True, timeout=args.http_timeout, allow_redirects=True)
+        ctx.record("external", name, STATUS_OK, "%s — доступен, код %d%s" % (
+            url, response.status_code, proxy_note))
+        return
+    except requests.exceptions.SSLError as e:
+        ctx.record("external", name, STATUS_FAIL,
+                   "%s — TLS-ошибка: %s%s — вероятно, трафик перехватывается (прозрачный прокси) "
+                   "или в системе нет корневых сертификатов" % (url, error_summary(str(e)), proxy_note))
+        return
+    except Exception as e:
+        ctx.record("external", name, STATUS_FAIL, "%s — недоступен: %s%s (исходящий 443/tcp, DNS)" % (
+            url, error_summary(str(e)), proxy_note))
+
+
+@check("external", "license.getcompass.ru")
+def check_external_license(ctx):
+    external_http_check(ctx, "license.getcompass.ru", "https://license.getcompass.ru/")
+
+
+@check("external", "push-сервер getCompass")
+def check_external_push(ctx):
+    external_http_check(ctx, "push-сервер getCompass", "https://push-onpremise.getcompass.ru/")
+
+
+@check("external", "docker registry")
+def check_external_registry(ctx):
+    external_http_check(ctx, "docker registry", "https://docker.getcompass.ru/v2/")
+
+
+@check("external", "billing-домен")
+def check_external_billing(ctx):
+    if not ctx.values_loaded:
+        ctx.record("external", "billing-домен", STATUS_SKIP, "values не загружены")
+        return
+
+    billing_domain = ctx.value("billing_domain")
+    if not billing_domain or "example.com" in billing_domain:
+        ctx.record("external", "billing-домен", STATUS_SKIP,
+                   "billing_domain не задан (%r) — биллинг не используется" % billing_domain)
+        return
+
+    external_http_check(ctx, "billing-домен", "https://%s/" % billing_domain)
+
+
+@check("external", "SMTP (исходящая почта)")
+def check_external_smtp(ctx):
+    # настройки почты живут в configs/auth.yaml инсталлятора (не в values)
+    auth_path = Path(ctx.installer_dir) / "configs" / "auth.yaml"
+    if not auth_path.exists():
+        ctx.record("external", "SMTP (исходящая почта)", STATUS_SKIP,
+                   "не найден %s — почта не настроена (коды/письма не отправляются)" % auth_path)
+        return
+
+    try:
+        import yaml as yaml_module
+
+        auth_config = yaml_module.safe_load(auth_path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        ctx.record("external", "SMTP (исходящая почта)", STATUS_WARN,
+                   "не удалось прочитать configs/auth.yaml: %s" % e)
+        return
+
+    # ключи зовутся по-разному в разных версиях — собираем щедро
+    def find_auth_value(*keys):
+        for key in keys:
+            for source in (auth_config, auth_config.get("mail") or {}, auth_config.get("smtp") or {}):
+                if isinstance(source, dict) and source.get(key):
+                    return source[key]
+        return None
+
+    smtp_host = find_auth_value("host", "smtp_host", "server", "smtp_server")
+    smtp_port = find_auth_value("port", "smtp_port", "secure_port")
+    if not smtp_host:
+        # метод mail включён, а SMTP не настроен — коды подтверждения не уйдут
+        available_methods = auth_config.get("available_methods") or []
+        if "mail" in available_methods:
+            ctx.record("external", "SMTP (исходящая почта)", STATUS_WARN,
+                       "available_methods содержит mail, но smtp-хост в configs/auth.yaml не задан — "
+                       "коды подтверждения отправляться не будут")
+        else:
+            ctx.record("external", "SMTP (исходящая почта)", STATUS_SKIP,
+                       "в configs/auth.yaml не найден smtp-хост — почта не настроена")
+        return
+
+    smtp_port = int(smtp_port or 587)
+    try:
+        with socket.create_connection((str(smtp_host), smtp_port), timeout=args.http_timeout):
+            ctx.record("external", "SMTP (исходящая почта)", STATUS_OK,
+                       "%s:%d — доступен" % (smtp_host, smtp_port))
+    except Exception as e:
+        ctx.record("external", "SMTP (исходящая почта)", STATUS_FAIL,
+                   "%s:%d — недоступен: %s (firewall/DNS или неверные настройки)" % (
+                       smtp_host, smtp_port, error_summary(str(e))))
+
+
+# ---ПРОВЕРКИ: ФУНКЦИОНАЛЬНЫЕ СМОУК-ТЕСТЫ (запускаются только с --functional)---#
+
+@check("functional", "автоудаление файлов: очередь")
+def check_functional_file_queue(ctx):
+    if not ctx.values_loaded:
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_SKIP, "values не загружены")
+        return
+
+    auto_deletion = ctx.value("file_auto_deletion", {}) or {}
+    if not auto_deletion.get("is_enabled"):
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_SKIP,
+                   "автоудаление отключено (file_auto_deletion.is_enabled=0)")
+        return
+
+    file_ttl = auto_deletion.get("file_ttl")
+    try:
+        file_ttl_days = int(file_ttl)
+    except (TypeError, ValueError):
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_SKIP,
+                   "file_ttl не задан — ttl-очередь не считается")
+        return
+
+    monolith_label = ctx.value("projects.monolith.label", "monolith")
+    containers = []
+    for stack in ctx.stacks():
+        if stack.endswith("-%s" % monolith_label):
+            containers = find_containers(ctx, stack, "mysql-%s" % monolith_label)
+            break
+
+    if not containers:
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_SKIP,
+                   "не найден контейнер mysql монолита на этой ноде")
+        return
+
+    sql = ("SELECT COUNT(*) FROM `file_node`.`file` "
+           "WHERE is_deleted=0 AND last_access_at < DATE_SUB(NOW(), INTERVAL %d DAY)" % file_ttl_days)
+    ok, out = mysql_query(ctx, containers[0], sql)
+    if not ok:
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_SKIP,
+                   "запрос не выполнился (таблица file_node.file отсутствует?): %s" % first_line(out))
+        return
+
+    try:
+        queue_size = int(re.search(r"\d+", out.splitlines()[-1]).group(0))
+    except (AttributeError, ValueError, IndexError):
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_SKIP,
+                   "не удалось разобрать ответ: %s" % first_line(out))
+        return
+
+    if queue_size >= 50000:
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_FAIL,
+                   "%d просроченных файлов — критично: пакетное удаление упадёт по OOM "
+                   "(exit 255), удаляйте порциями (см. базу знаний: file-node-exit-255-oom)" % queue_size)
+    elif queue_size >= 1000:
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_WARN,
+                   "%d просроченных файлов — следите за размером, большие пачки опасны (OOM)" % queue_size)
+    else:
+        ctx.record("functional", "автоудаление файлов: очередь", STATUS_OK,
+                   "%d просроченных файлов (ttl=%d дн.)" % (queue_size, file_ttl_days))
+
+
+@check("functional", "крон автоудаления в file-node")
+def check_functional_file_cron(ctx):
+    # при выключенном автоудалении задачи в кроне и не должно быть
+    auto_deletion = ctx.value("file_auto_deletion", {}) or {}
+    if ctx.values_loaded and not auto_deletion.get("is_enabled"):
+        ctx.record("functional", "крон автоудаления в file-node", STATUS_SKIP,
+                   "автоудаление отключено (file_auto_deletion.is_enabled=0) — задачи в кроне не ожидается")
+        return
+
+    file_node_containers = []
+    for stack in ctx.stacks():
+        file_node_containers = find_containers(ctx, stack, "php-file-node")
+        if file_node_containers:
+            break
+
+    if not file_node_containers:
+        ctx.record("functional", "крон автоудаления в file-node", STATUS_SKIP,
+                   "не найден контейнер php-file-node на этой ноде")
+        return
+
+    container = file_node_containers[0]
+
+    # смонтированный crontab (docker config file-node-crontab)
+    rc, mounted = exec_in_container(
+        container, "cat /app/src/Compass/FileNode/sh/cron/crontab.cron 2>/dev/null")
+    mounted_has_job = rc == 0 and "delete_expired_files" in mounted
+
+    # активный crontab пользователя внутри контейнера
+    rc, active = exec_in_container(container, "crontab -l 2>/dev/null")
+    active_has_job = rc == 0 and "delete_expired_files" in active
+
+    if mounted_has_job and active_has_job:
+        ctx.record("functional", "крон автоудаления в file-node", STATUS_OK,
+                   "задача delete_expired_files в кронтабе (смонтирован и активен)")
+    elif mounted_has_job and not active_has_job:
+        ctx.record("functional", "крон автоудаления в file-node", STATUS_WARN,
+                   "конфиг крона смонтирован, но в активном crontab -l задачи нет — "
+                   "cron может не работать (проверьте процесс cron в контейнере)")
+    elif not mounted_has_job:
+        ctx.record("functional", "крон автоудаления в file-node", STATUS_FAIL,
+                   "в /app/src/Compass/FileNode/sh/cron/crontab.cron нет delete_expired_files — "
+                   "автоудаление файлов не запланировано")
+    else:
+        ctx.record("functional", "крон автоудаления в file-node", STATUS_OK,
+                   "задача в активном crontab есть")
+
+
+@check("functional", "manticore: живость поиска")
+def check_functional_manticore(ctx):
+    manticore_containers = []
+    for stack in ctx.stacks():
+        manticore_containers = find_containers(ctx, stack, "manticore")
+        if manticore_containers:
+            break
+
+    if not manticore_containers:
+        ctx.record("functional", "manticore: живость поиска", STATUS_SKIP,
+                   "не найден контейнер manticore на этой ноде")
+        return
+
+    container = manticore_containers[0]
+    rc, out = exec_in_container(
+        container, "mysql -h127.0.0.1 -P9306 --connect-timeout=5 -e 'SHOW STATUS LIKE %suptime%s' 2>&1" % ("'", "'"))
+
+    if rc == 0 and "uptime" in out.lower():
+        uptime_line = [line for line in out.splitlines() if "uptime" in line.lower()]
+        ctx.record("functional", "manticore: живость поиска", STATUS_OK,
+                   "searchd отвечает: %s" % (uptime_line[0].strip() if uptime_line else "ok"))
+        return
+
+    if "not found" in out.lower() or "command not found" in out.lower():
+        ctx.record("functional", "manticore: живость поиска", STATUS_SKIP,
+                   "в образе manticore нет mysql-клиента — проверка через порт есть в группе db")
+        return
+
+    ctx.record("functional", "manticore: живость поиска", STATUS_FAIL,
+               "searchd не отвечает на запрос: %s" % first_line(out))
+
+
 @check("db", "mysql монолита")
 def check_db_monolith(ctx):
     monolith_label = ctx.value("projects.monolith.label", "monolith")
@@ -1413,6 +1829,9 @@ def main():
             ", ".join(unknown_groups), ", ".join(known_groups)))
 
     for check_item in CHECKS:
+        # функциональные смоук-тесты — только по явному флагу
+        if check_item["group"] == "functional" and not args.functional:
+            continue
         if only_groups and check_item["group"] not in only_groups:
             continue
         run_check_safely(check_item, ctx)
