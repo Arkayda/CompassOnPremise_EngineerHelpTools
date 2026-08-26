@@ -125,6 +125,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("bundle", type=str, help="Путь к tar.gz бандла или к распакованному каталогу")
 parser.add_argument("--top", required=False, default=15, type=int, help="Сколько проблем показывать в сводке")
 parser.add_argument("--samples", required=False, default=3, type=int, help="Примеров строк лога на паттерн")
+parser.add_argument("--timeline", required=False, default=15, type=int, help="Сколько событий показывать в таймлайне")
 parser.add_argument("--no-color", required=False, action="store_true", help="Отключить цветной вывод")
 args = parser.parse_args()
 
@@ -134,6 +135,9 @@ NO_COLOR = args.no_color
 
 # находка: (статус, раздел, заголовок, детали, источник)
 FINDINGS = []
+
+# таймлайн событий: (datetime или строка часа, описание, источник) — печатается отдельной секцией
+TIMELINE = []
 
 
 def add_finding(status, section, title, details="", source=""):
@@ -565,6 +569,12 @@ def analyze_logs(bundle_dir):
                 hour_stats[service_name][hour] += 1
             repeated[service_name][normalize_message(clean_line)] += 1
 
+    # часы с ошибками каждого сервиса — в общий таймлайн
+    for service_name, hours in hour_stats.items():
+        for hour, count in hours.items():
+            TIMELINE.append((hour, "%d ошибок: %s" % (count, service_name),
+                             "logs/%s.log" % service_name))
+
     # сводка по сервисам
     totals = []
     for service_name, per_pattern in pattern_stats.items():
@@ -648,6 +658,109 @@ def print_log_samples(bundle_dir):
     print("")
 
 
+# ---ТАЙМЛАЙН И РЕСТАРТ-ШТОРМ---#
+
+# возраст вида "6 days ago" / "About a minute ago" в секундах
+def parse_relative_age(text):
+    match = re.search(r"(\d+)\s+(second|minute|hour|day|week|month)s?\s+ago", text or "")
+    if match:
+        multipliers = {"second": 1, "minute": 60, "hour": 3600, "day": 86400,
+                       "week": 604800, "month": 2592000}
+        return int(match.group(1)) * multipliers[match.group(2)]
+    if re.search(r"about an? .+ ago", text or ""):
+        return 60
+    return None
+
+
+# дата сбора бандла из system.txt (вывод date) — привязка относительных времён
+def parse_bundle_date(bundle_dir):
+    text = read_text(bundle_dir, "system.txt")
+    if not text:
+        return None
+
+    for line in text.splitlines():
+        if re.match(r"^[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \w+ \d{4}$", line.strip()):
+            try:
+                return datetime.strptime(line.strip(), "%a %b %d %H:%M:%S %Z %Y")
+            except ValueError:
+                break
+
+    match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})", text)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+    return None
+
+
+# события из упавших задач + рестарт-шторм из docker ps -a
+def parse_timeline_and_restarts(bundle_dir):
+    from datetime import timedelta
+
+    bundle_date = parse_bundle_date(bundle_dir)
+
+    # упавшие задачи: "Failed 6 days ago" -> примерное абсолютное время
+    tasks_text = read_text(bundle_dir, "docker_failed_tasks.txt")
+    if tasks_text and "не найдено" not in tasks_text and bundle_date:
+        for line in tasks_text.splitlines():
+            age_seconds = parse_relative_age(line)
+            if age_seconds is None:
+                continue
+
+            exit_match = re.search(r"non-zero exit \((\d+)\)", line)
+            name_match = re.search(r"([\w\-]+_(?:[\w\-]+))", line)
+            description = "задача упала"
+            if exit_match:
+                description = "задача упала (exit %s)" % exit_match.group(1)
+            if name_match:
+                description += ": %s" % name_match.group(1).split("_")[-1]
+
+            event_time = bundle_date - timedelta(seconds=age_seconds)
+            TIMELINE.append((event_time.strftime("%Y-%m-%d %H:%M"), description, "docker_failed_tasks.txt"))
+
+    # рестарт-шторм: контейнер живёт давно, но Up недавно — значит перезапускался
+    docker_text = read_text(bundle_dir, "docker.txt")
+    ps_block = command_block(docker_text, "docker ps -a") if docker_text else ""
+    storm = []
+    for line in ps_block.splitlines():
+        up_match = re.search(r"\bUp (?:\d+ seconds?|Less than a second|\d+ minutes?|About a minute)\b", line)
+        if not up_match:
+            continue
+        created_match = re.search(r"\b\d+ (?:hours?|days?|weeks?|months?) ago\b", line)
+        if not created_match:
+            continue
+
+        fields = line.split()
+        storm.append(fields[-1] if fields else line.strip()[:60])
+
+    if len(storm) >= 3:
+        add_finding(STATUS_WARN, "Рестарт-шторм",
+                    "Контейнеры недавно перезапущены при давнем создании (%d)" % len(storm),
+                    "\n".join("      %s" % name for name in storm[:10]) +
+                    "\n      смотрите docker service ps <сервис> и логи: вероятно, падают по кругу",
+                    "docker.txt")
+    elif storm:
+        add_finding(STATUS_INFO, "Рестарт-шторм",
+                    "Недавно перезапущен 1 контейнер (%s)" % storm[0], "", "docker.txt")
+
+
+# напечатать таймлайн (сортировка по времени, новые сверху)
+def print_timeline():
+    if not TIMELINE:
+        return
+
+    def sort_key(item):
+        # форматы разные ("2026/08/26 12" из логов и "2026-08-26 14:36" из задач) —
+        # приводим к одному виду, чтобы сортировка была честной
+        return str(item[0]).replace("/", "-")
+
+    print(colorize(STATUS_INFO, "── Таймлайн событий (по логам и упавшим задачам) " + "─" * 30))
+    for event_time, description, source in sorted(TIMELINE, key=sort_key, reverse=True)[:max(1, args.timeline)]:
+        print("  %-18s %s" % (event_time, description))
+    print("")
+
+
 # ---ОТЧЁТ---#
 
 def print_report(bundle_dir):
@@ -721,6 +834,7 @@ def main():
             ("mysql", lambda: parse_mysql(bundle_dir)),
             ("diagnose", lambda: parse_diagnose(bundle_dir)),
             ("логи", lambda: analyze_logs(bundle_dir)),
+            ("таймлайн", lambda: parse_timeline_and_restarts(bundle_dir)),
         ]
         import traceback
 
@@ -732,6 +846,7 @@ def main():
                             traceback.format_exc(limit=3))
 
         print_report(bundle_dir)
+        print_timeline()
         print_log_samples(bundle_dir)
     finally:
         if temp_root:
