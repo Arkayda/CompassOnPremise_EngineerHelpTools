@@ -159,6 +159,24 @@ python3 fleet_status.py --stand onpremise-test
 Код завершения: `1` если на каком-то стенде есть FAIL или он недоступен.
 Требует локально pyyaml и ssh-ключи с доступом к стендам.
 
+## wiki_fetch.py + wiki_search.py — офлайн-база знаний Compass
+
+Выкачивает статическую базу знаний Compass (VitePress, `wiki.service.sel.apitest.team`,
+канонический `getcompass.wiki`) в локальный markdown-дамп и ищет по нему. В базе —
+deep-docs по инсталлятору (архитектура, replication, jitsi, swarm-guide, playbook
+«симптом → проверка», каталог 127 ошибок с файлами/строками) и внутренняя API-документация.
+
+```bash
+python3 wiki_fetch.py                                   # скачать всё в ~/compass-wiki (~220 страниц, минуты)
+python3 wiki_search.py replication manticore            # слова (все на одной странице), сниппеты с подсветкой
+python3 wiki_search.py 'push.*401' --regex              # regex-поиск
+python3 wiki_search.py --dump /tmp/wiki-test ...        # другой каталог дампа
+```
+
+Дамп лежит вне репозитория (`~/compass-wiki`), обновляется повторным запуском fetch.
+Помимо поиска скриптами, дамп читается напрямую — страницы уже в markdown и рассчитаны
+в том числе на LLM/RAG.
+
 ## Структура
 
 - `common.py` — общие хелперы: цвета, загрузка values, автопоиск каталога инсталлятора,
@@ -172,6 +190,7 @@ python3 fleet_status.py --stand onpremise-test
 - `update_dry_run.py` — аудит перед обновлением инсталлятора
 - `security_scan.py` — аудит безопасности окружения
 - `fleet_status.py` + `stands.example.yaml` — сводный статус стендов по SSH
+- `wiki_fetch.py` / `wiki_search.py` — офлайн-копия базы знаний Compass и поиск по ней
 
 ## Добавление своих проверок в diagnose.py
 
