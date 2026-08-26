@@ -1,0 +1,33 @@
+# Список стендов для fleet_status.py.
+# Скопируйте в stands.yaml (в git не попадает — он в .gitignore) и впишите свои стенды.
+#
+# Обязательные поля: name, host. Остальные — по ситуации.
+#
+#   user         — под кем заходим по ssh (по умолчанию root)
+#   ssh_key      — путь к ключу (например ~/.ssh/id_rsa); по умолчанию агент/дефолтный ключ
+#   port         — ssh-порт (по умолчанию 22)
+#   use_sudo     — запускать diagnose через sudo (по умолчанию: да для не-root пользователей)
+#   tools_dir    — каталог с инструментами на стенде (по умолчанию /tmp/tools);
+#                  разложите их туда: scp diagnose.py common.py errors_kb.yaml user@host:/tmp/tools/
+#   environment  — окружение для diagnose (по умолчанию production)
+#   values       — values-файл окружения (по умолчанию compass)
+#   installer_dir— каталог инсталлятора, если не находится автоматически
+#   timeout      — таймаут на стенд в секундах (по умолчанию 300)
+
+stands:
+
+  - name: onpremise-test
+    host: 82.202.159.249
+    user: user1
+    ssh_key: ~/.ssh/id_rsa
+    tools_dir: /tmp/tools
+    environment: production
+    values: compass
+    installer_dir: /opt/onpremise-installer
+
+  # - name: load-test
+  #   host: 161.104.52.19
+  #   user: root
+  #   tools_dir: /opt/tools
+  #   environment: production
+  #   values: compass-monolith
