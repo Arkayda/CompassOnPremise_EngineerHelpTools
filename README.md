@@ -70,6 +70,19 @@ python3 analyze_logs.py --pattern 'socket.*refused' --dump    # свой regex +
 python3 analyze_logs.py --pattern 'MY-CODE' --pattern-only    # только свой паттерн
 ```
 
+## analyze_bundle.py — разбор бандла на машине инженера
+
+Вскрывает tar.gz от `collect_info.py` (или готовый каталог) и печатает готовый разбор:
+сводка проблем по убыванию важности, детали по разделам (диск, память, ноды, сервисы,
+упавшие задачи, конфигурация, сертификаты, mysql, находки diagnose), анализ логов
+(топ сервисов по ошибкам, часы-пики, самое частое сообщение) и примеры строк.
+Требует только python 3.8+ (docker не нужен, pyyaml опционален).
+
+```bash
+python3 analyze_bundle.py /tmp/compass_info_<хост>_<дата>.tar.gz   # разбор архива
+python3 analyze_bundle.py ./compass_info_<хост>_<дата> --top 30    # распакованный каталог
+```
+
 ## Структура
 
 - `common.py` — общие хелперы: цвета, загрузка values, автопоиск каталога инсталлятора,
@@ -77,6 +90,7 @@ python3 analyze_logs.py --pattern 'MY-CODE' --pattern-only    # только с�
 - `diagnose.py` — полная диагностика окружения
 - `collect_info.py` — сбор информационного бандла для поддержки
 - `analyze_logs.py` — анализ логов сервисов после инцидента
+- `analyze_bundle.py` — офлайн-разбор бандла collect_info на машине инженера
 
 ## Добавление своих проверок в diagnose.py
 
