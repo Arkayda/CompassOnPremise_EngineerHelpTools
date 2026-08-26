@@ -60,6 +60,48 @@ LOG_ERROR_PATTERNS = [
 # известные run-once сервисы: для них 0/1 и успешное завершение — норма
 RUN_ONCE_SERVICE_PREFIXES = ("default-file", "jitsi-custom")
 
+# локальный загрузчик базы знаний (не импортируем common.py: он тянет pyyaml на верхнем уровне,
+# а analyze_bundle должен работать вообще без зависимостей; yaml здесь — опционально)
+def load_errors_kb():
+    try:
+        import re as re_module
+        import yaml as yaml_module
+
+        kb_path = Path(__file__).resolve().parent / "errors_kb.yaml"
+        if not kb_path.exists():
+            return []
+
+        data = yaml_module.safe_load(kb_path.read_text(encoding="utf-8")) or {}
+        entries = []
+        for raw in (data.get("entries") or []):
+            compiled_patterns = []
+            for pattern in (raw.get("patterns") or []):
+                try:
+                    compiled_patterns.append(re_module.compile(pattern))
+                except re_module.error:
+                    continue
+            if compiled_patterns:
+                entries.append({
+                    "id": raw.get("id", ""),
+                    "title": raw.get("title", ""),
+                    "cause": (raw.get("cause") or "").strip(),
+                    "fix": (raw.get("fix") or "").strip(),
+                    "severity": raw.get("severity", "warn"),
+                    "doc": raw.get("doc", ""),
+                    "patterns": compiled_patterns,
+                })
+        return entries
+    except Exception:
+        return []
+
+
+def match_error_kb(kb_entries, line):
+    for entry in kb_entries:
+        for pattern in entry["patterns"]:
+            if pattern.search(line):
+                return entry
+    return None
+
 # форматы времени в начале строк логов (go/php)
 TIMESTAMP_RES = [
     re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}):\d{2}"),
@@ -490,6 +532,8 @@ def analyze_logs(bundle_dir):
     samples = defaultdict(list)  # (сервис, паттерн) -> строки
     hour_stats = defaultdict(Counter)  # сервис -> час -> счёт
     repeated = defaultdict(Counter)  # сервис -> нормализованное сообщение -> счёт
+    kb_hits = defaultdict(lambda: defaultdict(int))  # сервис -> kb_id -> счёт
+    kb_entries = load_errors_kb()
 
     for log_path in sorted(logs_dir.glob("*.log")):
         service_name = log_path.stem
@@ -509,6 +553,12 @@ def analyze_logs(bundle_dir):
                     matched_any = True
             if not matched_any:
                 continue
+
+            # строка уже похожа на ошибку — сверяем с базой известных проблем
+            if kb_entries:
+                kb_entry = match_error_kb(kb_entries, clean_line)
+                if kb_entry:
+                    kb_hits[service_name][kb_entry["id"]] += 1
 
             hour = extract_hour(clean_line)
             if hour:
@@ -541,6 +591,30 @@ def analyze_logs(bundle_dir):
             if count >= 5:
                 add_finding(STATUS_INFO, "Логи", "  ↳ чаще всего (×%d): %s" % (count, message[:200]),
                             "", "logs/%s.log" % service_name)
+
+    # известные проблемы из базы знаний — отдельным разделом с рецептами
+    if not kb_hits or not kb_entries:
+        return
+
+    entries_by_id = dict((entry["id"], entry) for entry in kb_entries)
+    for service_name, per_id in kb_hits.items():
+        for kb_id, count in sorted(per_id.items(), key=lambda item: -item[1]):
+            entry = entries_by_id.get(kb_id)
+            if not entry:
+                continue
+
+            status = STATUS_CRIT if entry["severity"] == "crit" else STATUS_WARN
+            details_parts = []
+            if entry["cause"]:
+                details_parts.append("причина:   %s" % entry["cause"])
+            if entry["fix"]:
+                details_parts.append("лечение:  %s" % entry["fix"])
+            if entry["doc"]:
+                details_parts.append("доки:     %s" % entry["doc"])
+
+            add_finding(status, "Известные проблемы",
+                        "%s: %s ×%d" % (service_name, entry["title"], count),
+                        "\n".join(details_parts), "logs/%s.log" % service_name)
 
 
 # отдельно: примеры строк для сводки проблем

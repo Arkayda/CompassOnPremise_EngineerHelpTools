@@ -15,6 +15,7 @@ from collections import defaultdict
 
 from common import (
     assert_root, blue, warning, error, create_parser, run_cmd,
+    load_errors_kb, match_error_kb,
 )
 
 assert_root()
@@ -108,6 +109,10 @@ def main():
     stats = defaultdict(lambda: defaultdict(lambda: [0, []]))
     total_lines = 0
 
+    # база знаний: {kb_id: {"entry": ..., "count": N, "services": {...}, "sample": str}}
+    kb_entries = load_errors_kb()
+    kb_stats = {}
+
     for service_name in service_names:
         rc_log, out_log, _ = run_cmd(
             ["docker", "service", "logs", "--since", args.since, "--tail", str(args.tail), service_name],
@@ -118,12 +123,24 @@ def main():
 
         for line in out_log.splitlines():
             total_lines += 1
+            matched_any = False
             for pattern_name, pattern in patterns:
                 if pattern.search(line):
+                    matched_any = True
                     entry = stats[service_name][pattern_name]
                     entry[0] += 1
                     if len(entry[1]) < args.samples:
                         entry[1].append(line.strip()[:400])
+
+            # строка уже похожа на ошибку — прогоняем через базу знаний
+            if matched_any and kb_entries:
+                kb_entry = match_error_kb(kb_entries, line)
+                if kb_entry:
+                    item = kb_stats.setdefault(kb_entry["id"], {
+                        "entry": kb_entry, "count": 0, "services": set(), "sample": line.strip()[:400],
+                    })
+                    item["count"] += 1
+                    item["services"].add(service_name)
 
     # сводка
     print("")
@@ -168,6 +185,26 @@ def main():
             for line in out_log.splitlines():
                 if any(pattern.search(line) for _, pattern in patterns):
                     print("%s: %s" % (service_name, line.strip()[:600]))
+
+    # известные проблемы из базы знаний
+    if kb_stats:
+        print("")
+        print(blue("── Известные проблемы (база знаний errors_kb.yaml) ──"))
+        for item in sorted(kb_stats.values(), key=lambda item: -item["count"]):
+            entry = item["entry"]
+            severity_label = warning("[CRIT]") if entry["severity"] == "crit" else warning("[WARN]")
+            print("")
+            print("  %s %s — ×%d в %s" % (
+                severity_label, entry["title"], item["count"],
+                ", ".join(sorted(item["services"])[:3]),
+            ))
+            if entry["cause"]:
+                print("    причина: %s" % entry["cause"].strip())
+            if entry["fix"]:
+                print("    что делать: %s" % entry["fix"].strip())
+            if entry["doc"]:
+                print("    доки: %s" % entry["doc"])
+            print("    пример: %s" % item["sample"][:300])
 
     print("")
     print("Просмотрено строк: %d, сервисов с совпадениями: %d" % (total_lines, len(stats)))

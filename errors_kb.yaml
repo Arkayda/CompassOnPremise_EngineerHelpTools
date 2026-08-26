@@ -1,0 +1,253 @@
+# База знаний известных проблем Compass On-premise.
+# Источники: doc-onpremise.getcompass.ru (troubleshooting, faq) + опыт поддержки и стендов.
+#
+# Формат записи:
+#   id       — короткий слаг
+#   patterns — список regex (re.search по строке лога)
+#   severity — crit | warn (как показывать в сводке)
+#   cause    — вероятная причина
+#   fix      — что делать
+#   doc      — ссылка на документацию
+#
+# Паттерны пишем узко: база срабатывает только на строках, уже совпавших
+# с общими паттернами ошибок (FATAL/ERROR/...), ложных срабатываний быть не должно.
+
+entries:
+
+  - id: installer-pip-externally-managed
+    title: "pip отказывается ставить пакеты (externally-managed-environment)"
+    patterns:
+      - "externally\\-managed\\-environment"
+    severity: warn
+    cause: >-
+      pip в новых Debian/Ubuntu защищает системное окружение Python от изменений.
+    fix: >-
+      Ставить пакеты через pip3 install --break-system-packages или использовать
+      виртуальное окружение инсталлятора (.venv, см. init-install/init.py).
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: installer-no-docker-module
+    title: "ModuleNotFoundError: No module named 'docker'"
+    patterns:
+      - "No module named 'docker'"
+    severity: warn
+    cause: >-
+      В системном python нет пакета docker (python-библиотека для работы с Docker API).
+    fix: >-
+      pip3 install docker (или --break-system-packages) либо запустить скрипты
+      через .venv инсталлятора: init-install/init.py поднимает окружение сам.
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: php-monolith-wont-start
+    title: "php_monolith не поднимается / постоянно падает"
+    patterns:
+      - "php[-_]monolith.*(restart|fall|падает|не поднялся)"
+      - "php[-_]monolith.*OOMKilled"
+    severity: crit
+    cause: >-
+      Чаще всего сервер не соответствует минимальным требованиям:
+      12 vCPU, 20 ГБ RAM, SSD 200 ГБ, случайное чтение ~1200 IOPS.
+    fix: >-
+      Проверить ресурсы (lscpu, free -h, df -h), замерить диск (fio),
+      посмотреть docker service ps и docker service logs php-monolith.
+    doc: "https://doc-onpremise.getcompass.ru/requirements.html"
+
+  - id: activation-server-unreachable
+    title: "Не удалось активировать сервер: недоступен по адресу"
+    patterns:
+      - "Не удалось активировать сервер"
+      - "Сервер недоступен по адресу"
+    severity: crit
+    cause: >-
+      Домен инсталляции не резолвится с сервера, закрыт 443/tcp наружу
+      или nginx инсталляции не отвечает.
+    fix: >-
+      Проверить DNS домена, открыт ли 443/tcp, отвечает ли nginx
+      (curl -vk https://домен/), корректен ли сертификат.
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: smtp-code-not-arriving
+    title: "Письма/коды SMTP не доходят"
+    patterns:
+      - "SMTP.*(error|fail|refused|timeout)"
+      - "mail_sender.*(error|fail)"
+      - "письмо не отправлено"
+    severity: warn
+    cause: >-
+      Неверные настройки SMTP-сервера: хост, порт, шифрование (SSL 465 / TLS 587),
+      логин/пароль, или провайдер блокирует 25 порт.
+    fix: >-
+      Смотреть лог mail_sender.log в pivot, проверить настройки почты в конфигах,
+      протестировать доставку внешним клиентом (например, swaks).
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: ssl-chain-incomplete
+    title: "Неполная цепочка SSL-сертификата"
+    patterns:
+      - "certificate verify failed"
+      - "verify error.*\\((20|21)\\)"
+      - "unable to get local issuer certificate"
+      - "tls: failed to verify certificate"
+    severity: crit
+    cause: >-
+      Сервер отдаёт только листовой сертификат без промежуточных.
+      Браузеры часто прощают, мобильные клиенты и часть библиотек — нет
+      (симптомы: Android не может авторизоваться, конференции не завершаются).
+    fix: >-
+      Собрать fullchain (листовой + промежуточные) в один файл и переустановить
+      сертификат; проверить: openssl s_client -showcerts -connect домен:443.
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: cert-expired
+    title: "Сертификат истёк"
+    patterns:
+      - "certificate has expired"
+      - "сертификат истёк"
+    severity: crit
+    cause: "Срок действия SSL-сертификата инсталляции закончился."
+    fix: "Заменить сертификат и перерендерить конфиги (generate_ssl_certificates.py + redeploy nginx)."
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: calls-no-audio-video
+    title: "В звонках нет звука/видео (WebRTC ICE failed)"
+    patterns:
+      - "ICE.*failed"
+      - "Failed to set up ICE"
+      - "no audio.*no video"
+    severity: warn
+    cause: >-
+      Закрыт UDP 10000 (порт медиа-трафика jvb) или неверный
+      media_advertise_ips при NAT.
+    fix: >-
+      Открыть 10000/udp наружу, проверить media_advertise_ips в values
+      (публичный IP при NAT), перегенерировать конфиг jitsi.
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: calls-connection-failed
+    title: "Connection failed при входе в конференцию"
+    patterns:
+      - "Connection failed.*jitsi"
+      - "не резолвится.*домен"
+      - "domain.*not resolvable"
+    severity: warn
+    cause: "Домен ВКС не резолвится из контейнеров (NAT/DNS внутри сети клиента)."
+    fix: "Проверить DNS-резолв домена с сервера и изнутри swarm-сети."
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: push-401-invalid-tokens
+    title: "Push-сервер отвечает 401 (getInvalidTokens)"
+    patterns:
+      - "getInvalidTokens"
+      - "push.*401"
+      - "push.*Unauthorized"
+    severity: warn
+    cause: "Невалидные push-токены/ключи в конфигурации пушера."
+    fix: "Проверить конфигурацию push (ключи Firebase/HMS/APNs) в конфигах pivot."
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: file-node-exit-255-oom
+    title: "file-node: exit 255 / NEW EXCEPTION без деталей (OOM автоудаления)"
+    patterns:
+      - "ATTENTION! NEW EXCEPTION"
+      - "exit(ed)? (with |status )?(code )?255"
+    severity: crit
+    cause: >-
+      Массовое автоудаление файлов (delete_expired_files.php) собирает весь список
+      в память: при сотнях тысяч просроченных строк — OOM (memory_limit 256M),
+      падение без стектрейса с кодом 255. OFFSET-пагинация дополнительно
+      «зависает» на больших объёмах.
+    fix: >-
+      Удалить backlog порциями (batch через file_ttl или hotfix-скрипт с порционным
+      циклом и keyset-курсором); следить за размером выборки file_node.file.
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: parse-missing-protocol
+    title: "parse \"://...\" missing protocol scheme (пустой host)"
+    patterns:
+      - "parse \"://"
+      - "missing protocol scheme"
+    severity: warn
+    cause: "В values не заполнен host (или другой адресный параметр) — nginx получает пустой upstream."
+    fix: "Заполнить host в файле окружения values и перерендерить конфиги."
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: mysql-gone-away
+    title: "MySQL server has gone away"
+    patterns:
+      - "MySQL server has gone away"
+    severity: warn
+    cause: >-
+      MySQL недоступен в момент запроса: рестарт контейнера, нехватка памяти,
+      разрыв соединения по таймауту, слишком большой пакет (max_allowed_packet).
+    fix: >-
+      Проверить рестарты mysql-контейнера (docker service ps), память хоста,
+      max_allowed_packet; в логах mysql — ошибки вида 'Killed' или 1040 too many connections.
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: oomkilled-any-service
+    title: "OOMKilled: контейнеру не хватило памяти"
+    patterns:
+      - "OOMKilled"
+      - "Out of memory"
+      - "oom-killer"
+      - "Killed process \\d+"
+    severity: crit
+    cause: "Хост или контрольная группа сервиса исчерпала память."
+    fix: "Проверить свободную память (free -h), найти потребителя, добавить RAM или ограничить аппетиты сервиса."
+    doc: "https://doc-onpremise.getcompass.ru/requirements.html"
+
+  - id: rabbit-unreachable
+    title: "RabbitMQ недоступен (amqp refused/unreachable)"
+    patterns:
+      - "rabbit.*(refused|unreachable|failed)"
+      - "amqp.*(refused|error|unreachable)"
+    severity: warn
+    cause: "Контейнер rabbit не поднялся, перегружен, или проблема в overlay-сети."
+    fix: "docker service ps <стек>_rabbit, логи rabbit, проверить память хоста."
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: manticore-unknown-index
+    title: "Manticore: unknown index"
+    patterns:
+      - "unknown index"
+    severity: warn
+    cause: "Индекс поиска не создан или не реплицирован (в конфиге manticore отсутствует)."
+    fix: "Проверить конфиг manticore и живость searchd; на репликации — состояние кластера."
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: ldap-auth-fails
+    title: "LDAP-авторизация не работает"
+    patterns:
+      - "ldap.*(fail|error|unable|invalid)"
+    severity: warn
+    cause: "Неверные настройки LDAP-подключения (хост, порт, bind DN, фильтры)."
+    fix: "Смотреть лог sso_ldap.log в pivot; проверить подключение ldapsearch с теми же параметрами."
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: oidc-auth-fails
+    title: "OIDC/SSO-авторизация не работает"
+    patterns:
+      - "oidc.*(fail|error|unable|invalid)"
+    severity: warn
+    cause: "Неверные настройки OIDC-провайдера (issuer, client_id/secret, сертификаты)."
+    fix: "Смотреть лог sso_oidc.log в pivot; сверить настройки с провайдером."
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  - id: disk-no-space
+    title: "No space left on device — переполнение диска"
+    patterns:
+      - "No space left on device"
+    severity: crit
+    cause: "Закончилось место на разделе с данными/docker."
+    fix: "Почистить: docker system prune, старые бэкапы, логи; проверить df -h."
+    doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
+
+  - id: license-server-unreachable
+    title: "Лицензионный сервер getCompass недоступен"
+    patterns:
+      - "license\\.getcompass.*(refused|timeout|unreachable|error)"
+      - "license.*\\.ru.*(refused|timeout)"
+    severity: crit
+    cause: "Сервер инсталляции не может выйти на license.getcompass.ru (443) — firewall/DNS/прокси."
+    fix: "Проверить с сервера: curl -v https://license.getcompass.ru/; открыть исходящий 443/tcp."
+    doc: "https://doc-onpremise.getcompass.ru/faq.html"
