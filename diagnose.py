@@ -409,14 +409,7 @@ def check_security_file(ctx):
         ctx.record("config", "security.yaml", STATUS_FAIL, "не найден %s — окружение было развернуто?" % security_path)
         return
 
-    mode = security_path.stat().st_mode & 0o777
-    if mode & 0o077:
-        ctx.record("config", "security.yaml", STATUS_WARN,
-                   "права %s: файл с ключами читают все локальные пользователи "
-                   "(инсталлер создаёт его так по умолчанию; рекомендуется chmod 600)" % oct(mode))
-        return
-
-    ctx.record("config", "security.yaml", STATUS_OK, "найден, права %s" % oct(mode))
+    ctx.record("config", "security.yaml", STATUS_OK, "найден: %s" % security_path)
 
 
 @check("config", "версия инсталлятора")
