@@ -6,7 +6,7 @@ sys.dont_write_bytecode = True
 
 # Диагностика работающего окружения Compass On-premise.
 # Скрипт прогоняет независимые проверки (конфигурация, инфраструктура, сервисы swarm,
-# HTTP-доступность, базы, kafka, логи, бэкапы) и не останавливается на исключениях:
+# HTTP-доступность, безопасность, базы, kafka, логи, бэкапы) и не останавливается на исключениях:
 # любая упавшая проверка помечается как FAIL, остальные продолжают выполняться.
 #
 # Часть набора инструментов tools/ — работает отдельно от репозитория инсталлятора.
@@ -78,14 +78,40 @@ LOG_TAIL_LIMIT = 2000
 # паттерны ошибок, которые ищем в логах сервисов
 LOG_ERROR_PATTERNS = [
     ("FATAL", re.compile(r"\bFATAL\b")),
+    ("ERROR", re.compile(r"\bERROR\b")),
     ("OOM", re.compile(r"OOMKilled|Out of memory|oom-killer|Killed process \d+")),
     ("panic", re.compile(r"panic:")),
     ("NEW EXCEPTION", re.compile(r"NEW EXCEPTION")),
     ("MySQL server has gone away", re.compile(r"MySQL server has gone away")),
+    ("deadlock", re.compile(r"Deadlock found", re.IGNORECASE)),
     ("Segmentation fault", re.compile(r"Segmentation fault")),
     ("exit 255", re.compile(r"exit(ed )?(with|status)? ?(code )?255\b")),
     ("connection refused", re.compile(r"Connection refused", re.IGNORECASE)),
+    ("timeout", re.compile(r"\btimeout\b|\bcontext deadline exceeded\b", re.IGNORECASE)),
 ]
+
+# сколько примеров строк на сервис показываем в группе logs
+LOG_SAMPLES_PER_SERVICE = 2
+
+# ---КОНСТАНТЫ: БЕЗОПАСНОСТЬ---#
+
+# известные пароли-плейсхолдеры из базового src/values.yaml инсталлятора
+DEFAULT_PASSWORDS = {
+    "4321", "root2", "1234", "12345678", "2toor",
+    "backup_user_password", "backup_archive_password",
+    "rnb5zrNf", "abcdef1234567890",
+}
+
+# ключи values, в которых ждём пароль/секрет
+PASSWORD_KEY_MARKERS = ("password", "pass", "secret", "api_secret")
+
+# опасные порты: базы и админка не должны торчать наружу
+DANGEROUS_PUBLISH_PORTS = {3306: "MySQL", 9306: "Manticore", 9200: "Elasticsearch",
+                           6379: "Redis", 5672: "RabbitMQ", 15672: "RabbitMQ UI",
+                           27017: "MongoDB", 2375: "Docker API (без TLS!)", 2376: "Docker API"}
+
+# легитимные сервисы, которым нужен доступ к docker-сокету
+DOCKER_SOCK_LEGITIMATE = ("go-database-controller",)
 
 # порядок и заголовки групп проверок
 GROUPS = [
@@ -94,6 +120,7 @@ GROUPS = [
     ("requirements", "Требования к серверу"),
     ("services", "Сервисы swarm"),
     ("http", "HTTP-доступность"),
+    ("security", "Безопасность"),
     ("external", "Внешние зависимости"),
     ("functional", "Функциональные смоук-тесты"),
     ("db", "Базы данных и поиск"),
@@ -108,7 +135,7 @@ RUN_ONCE_SERVICE_PREFIXES = ("default-file",)
 # ---АРГУМЕНТЫ СКРИПТА---#
 
 parser = create_parser(
-    description="Диагностика установленного окружения Compass On-premise: конфигурация, сервисы, базы, HTTP, логи, бэкапы.",
+    description="Диагностика установленного окружения Compass On-premise: конфигурация, инфраструктура, сервисы, HTTP, безопасность, базы, логи, бэкапы.",
     usage="python3 diagnose.py [-e ENVIRONMENT] [-v VALUES] [--installer-dir PATH] [--only GROUPS] [--since PERIOD] [--json] [--no-color]",
     epilog="Примеры:\n"
            "  python3 diagnose.py -e production -v compass\n"
@@ -127,8 +154,8 @@ parser.add_argument("--installer-dir", required=False, default=None, type=str,
                     help="Каталог установленного инсталлятора (по умолчанию ищется автоматически)")
 parser.add_argument("--only", required=False, default="", type=str,
                     help="Запустить только выбранные группы проверок (через запятую)")
-parser.add_argument("--since", required=False, default="1h", type=str,
-                    help="За какой период смотреть логи и упавшие задачи (формат docker: 1h, 30m, 24h)")
+parser.add_argument("--since", required=False, default="24h", type=str,
+                    help="За какой период смотреть логи и упавшие задачи (формат docker: 1h, 30m, 24h; по умолчанию 24h)")
 parser.add_argument("--http-timeout", required=False, default=DEFAULT_HTTP_TIMEOUT, type=int,
                     help="Таймаут HTTP-проверок в секундах")
 parser.add_argument("--log-tail", required=False, default=LOG_TAIL_LIMIT, type=int,
@@ -395,12 +422,28 @@ def check_security_file(ctx):
 @check("config", "версия инсталлятора")
 def check_version_file(ctx):
     version_path = Path(ctx.installer_dir + "/.version")
-    if not version_path.exists():
-        ctx.record("config", "версия инсталлятора", STATUS_WARN,
-                   "файл .version не найден — обновления через installer_migrations_up.py не отслеживаются")
+    version = version_path.read_text().strip() if version_path.exists() else ""
+
+    # git-состояние каталога инсталлятора: ветка и последний коммит (контекст для поддержки)
+    git_parts = []
+    rc, out, _ = run_cmd(["git", "-C", ctx.installer_dir, "branch", "--show-current"], timeout=15)
+    if rc == 0 and out.strip():
+        git_parts.append("ветка %s" % out.strip())
+    rc, out, _ = run_cmd(["git", "-C", ctx.installer_dir, "log", "--oneline", "-1"], timeout=15)
+    if rc == 0 and out.strip():
+        git_parts.append(out.strip())
+
+    if not version:
+        message = "файл .version не найден — обновления через installer_migrations_up.py не отслеживаются"
+        if git_parts:
+            message += " (git: %s)" % ", ".join(git_parts)
+        ctx.record("config", "версия инсталлятора", STATUS_WARN, message)
         return
 
-    ctx.record("config", "версия инсталлятора", STATUS_OK, version_path.read_text().strip())
+    message = version
+    if git_parts:
+        message += " (git: %s)" % ", ".join(git_parts)
+    ctx.record("config", "версия инсталлятора", STATUS_OK, message)
 
 
 @check("config", "каталог данных")
@@ -493,6 +536,29 @@ def check_swarm(ctx):
 
     ctx.record("infra", "swarm", STATUS_OK, "активен (%s)" % ((info.get("Swarm") or {}).get("ControlAvailable")
                                                               and "менеджер" or "воркер"))
+
+
+@check("infra", "место, занятое docker")
+def check_docker_usage(ctx):
+    rc, out, err = run_cmd(["docker", "system", "df"], timeout=60)
+    if rc != 0:
+        ctx.record("infra", "место, занятое docker", STATUS_SKIP,
+                   "docker system df не выполнился: %s" % err.strip()[:200])
+        return
+
+    # строки таблицы: Images / Containers / Local Volumes / Build Cache
+    parts = []
+    for line in out.splitlines():
+        fields = [field.strip() for field in line.split(maxsplit=5)]
+        if len(fields) >= 3 and fields[0] in ("Images:", "Containers:", "Local", "Build"):
+            label = fields[0].rstrip(":") + (" " + fields[1] if fields[0] == "Local" else "")
+            size_index = 3 if fields[0] == "Local" else 2
+            parts.append("%s: %s" % (label.rstrip(), fields[size_index] if len(fields) > size_index else "?"))
+
+    if not parts:
+        ctx.record("infra", "место, занятое docker", STATUS_OK, out.strip().replace("\n", "; ")[:200])
+    else:
+        ctx.record("infra", "место, занятое docker", STATUS_OK, ", ".join(parts))
 
 
 @check("infra", "ноды swarm")
@@ -1043,6 +1109,282 @@ def record_cert_result(ctx, name, days_left):
         status = STATUS_OK
 
     ctx.record("http", name, status, "истекает через %d дн." % days_left)
+
+
+# ---ПРОВЕРКИ: БЕЗОПАСНОСТЬ---#
+
+# загрузить сырой файл окружения (без мерджа с базовым) — для поиска дефолтов, которые не сменили
+def load_env_values_raw(ctx):
+    if not ctx.values_file_path:
+        return {}
+    try:
+        import yaml
+
+        return yaml.safe_load(Path(ctx.values_file_path).read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+@check("security", "пароли по умолчанию")
+def check_security_passwords(ctx):
+    if not ctx.values_loaded:
+        ctx.record("security", "пароли по умолчанию", STATUS_SKIP, "values не загружены")
+        return
+
+    findings = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_lower = str(key).lower()
+                child_path = "%s.%s" % (path, key) if path else str(key)
+                if isinstance(value, str) and any(marker in key_lower for marker in PASSWORD_KEY_MARKERS):
+                    if value in DEFAULT_PASSWORDS:
+                        findings.append((child_path, value))
+                else:
+                    walk(value, child_path)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, path)
+
+    walk(load_env_values_raw(ctx), "")
+
+    # и критичные пути из смёрженного конфига (могут прийти из базового файла)
+    for critical_path in (
+            "projects.pivot.service.mysql.root_password",
+            "projects.monolith.service.mysql.root_password",
+            "projects.kafka.service.kafka.password",
+    ):
+        value = ctx.value(critical_path)
+        if value in DEFAULT_PASSWORDS:
+            entry = (critical_path, value)
+            if entry not in findings:
+                findings.append(entry)
+
+    if findings:
+        details = "; ".join("%s=%s" % (path, value) for path, value in findings[:6])
+        ctx.record("security", "пароли по умолчанию", STATUS_FAIL,
+                   "в values остались пароли из шаблона (%d): %s — смените в файле окружения "
+                   "values и перерендерьте конфиги" % (len(findings), details))
+    else:
+        ctx.record("security", "пароли по умолчанию", STATUS_OK, "паролей-плейсхолдеров в values не найдено")
+
+
+@check("security", "плейсхолдеры конфигурации")
+def check_security_placeholders(ctx):
+    if not ctx.values_loaded:
+        ctx.record("security", "плейсхолдеры конфигурации", STATUS_SKIP, "values не загружены")
+        return
+
+    problems = []
+
+    host = ctx.value("host")
+    if host in (None, "", "example.com"):
+        problems.append("host=%r (плейсхолдер)" % host)
+
+    jitsi_app_secret = ctx.value("projects.jitsi.jwt.app_secret")
+    if not jitsi_app_secret:
+        problems.append("projects.jitsi.jwt.app_secret пуст — конференции без подписи JWT")
+
+    auth_secret = ctx.value("projects.auth.service.go_auth.secret_key_b64")
+    if auth_secret == "":
+        problems.append("projects.auth...secret_key_b64 пуст — go-auth работает без ключа")
+
+    if problems:
+        ctx.record("security", "плейсхолдеры конфигурации", STATUS_WARN, "; ".join(problems))
+    else:
+        ctx.record("security", "плейсхолдеры конфигурации", STATUS_OK, "не найдены")
+
+
+# какие порты ожидаются опубликованными наружу согласно values
+@check("security", "опубликованные порты")
+def check_security_ports(ctx):
+    rc, out, err = run_cmd(["docker", "service", "ls", "--format", "{{.Name}}|{{.Ports}}"], timeout=60)
+    if rc != 0:
+        ctx.record("security", "опубликованные порты", STATUS_SKIP,
+                   "docker service ls не выполнился: %s" % err.strip()[:200])
+        return
+
+    expected = set()
+
+    def add_expected(port):
+        try:
+            if port:
+                expected.add(int(port))
+        except (TypeError, ValueError):
+            pass
+
+    if ctx.values_loaded:
+        add_expected(ctx.value("projects.monolith.service.nginx.external_https_port"))
+        add_expected(ctx.value("projects.monolith.service.nginx.external_http_port"))
+        add_expected(ctx.value("projects.auth.service.go_auth.external_grpc_port"))
+        add_expected(ctx.value("projects.join_web.service.join_web.external_port"))
+        add_expected(ctx.value("projects.jitsi_web.service.jitsi_web.external_port"))
+        if ctx.value("projects.outlook_add_in.is_enabled"):
+            add_expected(ctx.value("projects.outlook_add_in.service.external_port"))
+        if ctx.value("siem.enabled_driver") == "kafka":
+            add_expected(ctx.value("projects.kafka.service.kafka.external_port"))
+            add_expected(ctx.value("siem.driver_data.listen_port"))
+
+        gateway_id = ctx.value("api_gateway_id", "gateway-1")
+        add_expected(ctx.value("projects.api_gateway.%s.service.go_api_gateway.external_https_port" % gateway_id))
+
+        # jitsi: веб, jicofo и просоди (включая версии компонент v0/v1/v2)
+        add_expected(ctx.value("projects.jitsi.service.web.https_port"))
+        add_expected(ctx.value("projects.jitsi.service.web.http_port"))
+        add_expected(ctx.value("projects.jitsi.service.jicofo.port"))
+        add_expected(ctx.value("projects.jitsi.service.prosody.serve_port"))
+        for suffix in ("", ".v0", ".v1", ".v2"):
+            add_expected(ctx.value("projects.jitsi.service.prosody%s.serve_port" % suffix))
+
+        for domino_config in (ctx.value("projects.domino") or {}).values():
+            if not isinstance(domino_config, dict):
+                continue
+            add_expected(domino_config.get("service", {}).get("manticore", {}).get("external_port"))
+            add_expected(domino_config.get("go_database_controller_port"))
+            add_expected(domino_config.get("go_database_controller_profiler_port"))
+
+        add_expected(ctx.value("projects.jitsi.service.jvb.media_port"))
+
+    dangerous, unexpected = [], []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        name, ports_field = line.split("|", 1)
+        for match in re.finditer(r"(?:[\d.]+|\*):(\d+)->", ports_field):
+            published_port = int(match.group(1))
+            if published_port in DANGEROUS_PUBLISH_PORTS:
+                dangerous.append("%d (%s) — сервис %s" % (
+                    published_port, DANGEROUS_PUBLISH_PORTS[published_port], name))
+            elif ctx.values_loaded and published_port not in expected:
+                unexpected.append("%d — сервис %s" % (published_port, name))
+
+    if dangerous:
+        ctx.record("security", "опубликованные порты", STATUS_FAIL,
+                   "наружу опубликованы порты баз/админок (%d): %s — закройте публикацию в compose проекта" % (
+                       len(dangerous), "; ".join(dangerous[:5])))
+    elif unexpected:
+        ctx.record("security", "опубликованные порты", STATUS_WARN,
+                   "неожиданные порты (%d): %s — сверьте со списком ожидаемых из values" % (
+                       len(unexpected), "; ".join(unexpected[:5])))
+    else:
+        ctx.record("security", "опубликованные порты", STATUS_OK,
+                   "наружу смотрят только ожидаемые порты (%d)" % len(expected))
+
+
+# получить PEM первого сертификата от сервера (без верификации)
+def fetch_tls_chain(host, port):
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        with socket.create_connection((host, port), timeout=args.http_timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+                protocol = tls_sock.version() or "?"
+                der_cert = tls_sock.getpeercert(binary_form=True)
+    except Exception as e:
+        return None, None, str(e)
+
+    if not der_cert:
+        return None, protocol, "сервер не отдал сертификат"
+
+    return ssl.DER_cert_to_PEM_cert(der_cert), protocol, None
+
+
+@check("security", "SSL-цепочка")
+def check_security_ssl_chain(ctx):
+    if not ctx.values_loaded:
+        ctx.record("security", "SSL-цепочка", STATUS_SKIP, "values не загружены")
+        return
+
+    host = ctx.value("host")
+    port = int(ctx.value("projects.monolith.service.nginx.external_https_port") or 443)
+    if not host or host == "example.com":
+        ctx.record("security", "SSL-цепочка", STATUS_SKIP, "host в values не задан (%r)" % host)
+        return
+
+    pem, protocol, error_text = fetch_tls_chain(host, port)
+    if error_text:
+        ctx.record("security", "SSL-цепочка", STATUS_SKIP,
+                   "не удалось подключиться к %s:%d: %s (проверка пропущена)" % (host, port, error_text[:150]))
+        return
+
+    # subject/issuer листового сертификата
+    rc, out, _ = run_cmd(["openssl", "x509", "-noout", "-subject", "-issuer"],
+                         timeout=15, input_bytes=pem.encode("utf-8"))
+    subject_cn = re.search(r"CN\s*=\s*([^,/]+)", out)
+    issuer_cn = re.search(r"issuer=.*?CN\s*=\s*([^,/]+)", out)
+    subject_name = subject_cn.group(1).strip() if subject_cn else "?"
+    issuer_name = issuer_cn.group(1).strip() if issuer_cn else "?"
+
+    if subject_name == issuer_name:
+        ctx.record("security", "SSL-цепочка", STATUS_WARN,
+                   "%s:%d — сертификат self-signed (CN=%s); проверка цепочки неприменима, "
+                   "клиенты должны доверять корневому CA (TLS %s)" % (host, port, subject_name, protocol))
+        return
+
+    # не self-signed — проверяем полноту цепочки через openssl s_client
+    rc, out, err = run_cmd(
+        ["openssl", "s_client", "-connect", "%s:%d" % (host, port), "-servername", host, "-showcerts"],
+        timeout=30, input_bytes=b"")
+    chain_length = out.count("BEGIN CERTIFICATE")
+    verify_ok = ": ok" in out
+    verify_error = re.search(r"verify error:([^\n]+)", out)
+
+    if chain_length >= 2 and verify_ok:
+        ctx.record("security", "SSL-цепочка", STATUS_OK,
+                   "%s:%d — цепочка из %d сертификатов, verify ok (TLS %s)" % (host, port, chain_length, protocol))
+    elif verify_error:
+        ctx.record("security", "SSL-цепочка", STATUS_FAIL,
+                   "%s:%d — %s; цепочка: %d серт. — соберите fullchain (листовой + промежуточные) "
+                   "и переустановите сертификат" % (host, port, verify_error.group(1).strip(), chain_length))
+    elif chain_length < 2:
+        ctx.record("security", "SSL-цепочка", STATUS_WARN,
+                   "%s:%d — сервер отдал только листовой сертификат (CN=%s, issuer=%s); часть клиентов "
+                   "(Android, библиотеки) не соберут цепочку — проверьте fullchain" % (
+                       host, port, subject_name, issuer_name))
+    else:
+        ctx.record("security", "SSL-цепочка", STATUS_WARN,
+                   "%s:%d — цепочка из %d серт., verify не ok; смотрите openssl s_client" % (
+                       host, port, chain_length))
+
+
+@check("security", "docker.sock")
+def check_security_docker_sock(ctx):
+    client = ctx.docker()
+    if client is None:
+        ctx.record("security", "docker.sock", STATUS_SKIP, "docker недоступен: %s" % ctx.docker_error)
+        return
+
+    mounted_containers = []
+    try:
+        for container in client.containers.list():
+            try:
+                mounts = container.attrs.get("Mounts") or []
+                if any("docker.sock" in str(mount.get("Source", "")) for mount in mounts):
+                    mounted_containers.append(container.name)
+            except Exception:
+                continue
+    except Exception as e:
+        ctx.record("security", "docker.sock", STATUS_SKIP, "не удалось получить контейнеры: %s" % e)
+        return
+
+    if not mounted_containers:
+        ctx.record("security", "docker.sock", STATUS_OK, "не смонтирован ни в один контейнер")
+        return
+
+    suspicious = [name for name in mounted_containers
+                  if not any(prefix in name for prefix in DOCKER_SOCK_LEGITIMATE)]
+    if suspicious:
+        ctx.record("security", "docker.sock", STATUS_WARN,
+                   "смонтирован в контейнеры (%d): %s — доступ к сокету = root на хосте; "
+                   "убедитесь, что это осознанно" % (
+                       len(mounted_containers), "; ".join(suspicious[:5])))
+    else:
+        ctx.record("security", "docker.sock", STATUS_OK,
+                   "смонтирован только в ожидаемые сервисы (%d)" % len(mounted_containers))
 
 
 # ---ПРОВЕРКИ: БАЗЫ ДАННЫХ---#
@@ -1611,13 +1953,33 @@ def check_db_monolith(ctx):
     expected_databases = ["pivot_system", "company_system"]
     missing = [db_name for db_name in expected_databases if db_name not in databases]
 
+    # контекст сервера: версия, аптайм, число подключений
+    context_parts = []
+    ok_ver, out_ver = mysql_query(ctx, container, "SELECT VERSION()")
+    if ok_ver:
+        version_lines = [line.strip() for line in out_ver.splitlines() if line.strip() and not line.startswith("+")]
+        if version_lines:
+            context_parts.append("MySQL %s" % version_lines[-1])
+    ok_st, out_st = mysql_query(ctx, container,
+                                "SHOW GLOBAL STATUS WHERE Variable_name IN ('Uptime','Threads_connected')")
+    if ok_st:
+        uptime = re.search(r"Uptime\s+\|\s*(\d+)", out_st)
+        threads = re.search(r"Threads_connected\s+\|\s*(\d+)", out_st)
+        if uptime:
+            days, hours = divmod(int(uptime.group(1)) // 3600, 24)
+            context_parts.append("uptime %dд %dч" % (days, hours))
+        if threads:
+            context_parts.append("потоков: %s" % threads.group(1))
+    context_text = " (%s)" % ", ".join(context_parts) if context_parts else ""
+
     if missing:
         ctx.record("db", "mysql монолита", STATUS_WARN,
-                   "подключение ок, но нет баз: %s (всего баз: %d)" % (", ".join(missing), len(databases)))
+                   "подключение ок, но нет баз: %s (всего баз: %d)%s" % (
+                       ", ".join(missing), len(databases), context_text))
         return
 
-    ctx.record("db", "mysql монолита", STATUS_OK, "подключение ок, базы %s на месте (%d баз)" % (
-        ", ".join(expected_databases), len(databases)))
+    ctx.record("db", "mysql монолита", STATUS_OK, "подключение ок, базы %s на месте (%d баз)%s" % (
+        ", ".join(expected_databases), len(databases), context_text))
 
 
 @check("db", "mysql команд (company)")
@@ -1769,8 +2131,13 @@ def check_kafka_topics(ctx):
 
 @check("logs", "ошибки в логах сервисов")
 def check_logs(ctx):
-    noisy = []
     kb_entries = load_errors_kb()
+
+    # {short_name: {"found": [(pattern, count), ...], "samples": [line, ...], "total": N}}
+    per_service = {}
+    top_messages = {}   # нормализованное сообщение -> [count, raw_line]
+    hour_hits = {}      # "HH" -> count (часы по таймстемпам строк-совпадений)
+    all_lines_scanned = 0
 
     for stack in ctx.stacks():
         for service in ctx.stack_services(stack):
@@ -1784,11 +2151,35 @@ def check_logs(ctx):
             if rc != 0:
                 continue  # логи могли ротироваться/сервис удалён — не шумим
 
-            found = []
-            for pattern_name, pattern in LOG_ERROR_PATTERNS:
-                count = len(pattern.findall(out))
-                if count > 0:
-                    found.append("%s×%d" % (pattern_name, count))
+            # счётчики паттернов по сервису + примеры строк
+            found_counts = {}
+            samples = []
+            for line in out.splitlines():
+                all_lines_scanned += 1
+                matched = [pattern_name for pattern_name, pattern in LOG_ERROR_PATTERNS if pattern.search(line)]
+                if not matched:
+                    continue
+
+                for pattern_name in matched:
+                    found_counts[pattern_name] = found_counts.get(pattern_name, 0) + 1
+                if len(samples) < LOG_SAMPLES_PER_SERVICE:
+                    samples.append(line.strip()[:300])
+
+                # самое частое сообщение: цифры -> N схлопываем
+                key = re.sub(r"\d+", "N", line.strip()[:300])
+                item = top_messages.setdefault(key, [0, line.strip()[:300]])
+                item[0] += 1
+
+                # час строки (docker: "service.1.abc@2026-08-27T10:12:34...")
+                hour_match = re.search(r"@\d{4}-\d{2}-\d{2}T(\d{2}):", line)
+                if hour_match:
+                    hour_hits[hour_match.group(1)] = hour_hits.get(hour_match.group(1), 0) + 1
+
+            if not found_counts:
+                continue
+
+            found = sorted(found_counts.items(), key=lambda item: -item[1])
+            total = sum(count for _, count in found)
 
             # сверка с базой известных проблем; одинаковые строки (цифры -> N)
             # схлопываем и матчим по одному представителю — повторы лишь увеличивают счётчик
@@ -1808,37 +2199,58 @@ def check_logs(ctx):
                         prev = kb_hits.get(entry["id"], (entry, 0))
                         kb_hits[entry["id"]] = (entry, prev[1] + counts[key])
 
-            if found or kb_hits:
-                noisy.append((short_name, found, kb_hits))
+            per_service[short_name] = {
+                "found": found, "samples": samples, "total": total, "kb_hits": kb_hits,
+            }
 
-    if not noisy:
+    if not per_service:
         ctx.record("logs", "ошибки в логах сервисов", STATUS_OK,
-                   "за %s критичных паттернов и известных проблем не найдено" % args.since)
+                   "за %s просмотрено %d строк — ошибок и известных проблем не найдено" % (
+                       args.since, all_lines_scanned))
         return
 
-    for short_name, found, kb_hits in noisy:
-        total = sum(int(re.search(r"×(\d+)$", item).group(1)) for item in found if re.search(r"×(\d+)$", item))
-
+    # записи по каждому сервису
+    for short_name, item in per_service.items():
         # известные проблемы: crit из базы — сразу FAIL, с рецептом в сообщении
         known_parts = []
         has_known_crit = False
-        for entry, count in sorted(kb_hits.values(), key=lambda item: -item[1]):
+        for entry, count in sorted(item["kb_hits"].values(), key=lambda entry_count: -entry_count[1]):
             known_parts.append("%s ×%d" % (entry["title"], count))
             if entry["severity"] == "crit":
                 has_known_crit = True
-        if known_parts:
-            top_entry = sorted(kb_hits.values(), key=lambda item: -item[1])[0][0]
-            recipe = " — %s" % top_entry["fix"][:200] if top_entry["fix"] else ""
 
-        if total >= LOG_FAIL_COUNT or has_known_crit:
-            status = STATUS_FAIL
-        else:
-            status = STATUS_WARN
+        top_kb = sorted(item["kb_hits"].values(), key=lambda entry_count: -entry_count[1])
+        recipe = " — %s" % top_kb[0][0]["fix"][:200] if top_kb and top_kb[0][0]["fix"] else ""
 
-        message_parts = list(found)
+        status = STATUS_FAIL if (item["total"] >= LOG_FAIL_COUNT or has_known_crit) else STATUS_WARN
+
+        message_parts = ["%s ×%d" % (pattern_name, count) for pattern_name, count in item["found"]]
         if known_parts:
             message_parts.append("известная проблема: %s%s" % ("; ".join(known_parts[:2]), recipe))
+        if item["samples"]:
+            message_parts.append("пример: %s" % item["samples"][0])
         ctx.record("logs", short_name, status, ", ".join(message_parts))
+
+    # сводный топ сервисов по ошибкам
+    top_services = sorted(per_service.items(), key=lambda name_item: -name_item[1]["total"])[:5]
+    worst_status = STATUS_FAIL if any(
+        item["total"] >= LOG_FAIL_COUNT or any(entry["severity"] == "crit" for entry, _ in item["kb_hits"].values())
+        for _, item in top_services
+    ) else STATUS_WARN
+    ctx.record("logs", "топ сервисов по ошибкам", worst_status, "; ".join(
+        "%s ×%d" % (short_name, item["total"]) for short_name, item in top_services))
+
+    # самое частое сообщение (нормализованное)
+    if top_messages:
+        top_message_count, top_message_raw = max(top_messages.values(), key=lambda item: item[0])
+        ctx.record("logs", "самое частое сообщение", STATUS_WARN,
+                   "×%d: %s" % (top_message_count, top_message_raw[:200]))
+
+    # часы-пиков ошибок (если в логах есть таймстемпы docker)
+    if hour_hits:
+        peak_hours = sorted(hour_hits.items(), key=lambda hour_count: -hour_count[1])[:3]
+        ctx.record("logs", "часы-пиков ошибок", STATUS_WARN, "; ".join(
+            "%s:00 ×%d" % (hour, count) for hour, count in peak_hours))
 
 
 # ---ПРОВЕРКИ: БЭКАПЫ---#
@@ -1919,14 +2331,30 @@ def print_report(ctx):
     )
     print_line(summary_line)
 
+    # сначала FAIL, затем WARN; рецепты из базы знаний — если паттерн сработал на сообщение
     problems = [result for result in ctx.results if result["status"] in (STATUS_FAIL, STATUS_WARN)]
+    problems.sort(key=lambda result: 0 if result["status"] == STATUS_FAIL else 1)
+
     if problems:
+        kb_entries = load_errors_kb()
         print_line("")
         print_line("  Проблемы (%d):" % len(problems))
         for result in problems:
             marker = error("[FAIL]") if result["status"] == STATUS_FAIL else warning("[WARN]")
-            message = (": %s" % result["message"]) if result["message"] else ""
-            print_line("   %s %s%s" % (marker, result["name"], message.splitlines()[0] if message else ""))
+            message = result["message"] or ""
+            # в сводке — только первая строка сообщения (полный текст и traceback — выше, в теле группы)
+            first_line = message.splitlines()[0] if message else ""
+            if first_line:
+                print_line("   %s %s: %s" % (marker, result["name"], first_line))
+            else:
+                print_line("   %s %s" % (marker, result["name"]))
+
+            # рецепт из базы известных проблем (по тексту сообщения проверки)
+            if kb_entries:
+                match_text = "%s %s" % (result["name"], message)
+                kb_entry = match_error_kb(kb_entries, match_text)
+                if kb_entry and kb_entry["fix"] and kb_entry["fix"][:80] not in message:
+                    print_line(cyan("       что делать: %s" % kb_entry["fix"].strip()))
 
 
 # json-отчёт
