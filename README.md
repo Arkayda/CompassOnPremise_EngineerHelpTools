@@ -24,20 +24,20 @@ sudo python3 diagnose.py --json > /tmp/diagnose.json           # машиноч�
 
 | Группа | Что проверяет |
 |---|---|
-| `config` | values, security.yaml, .version (+ git-ветка инсталлятора), каталог данных, стеки swarm vs values |
-| `infra` | docker daemon, swarm, ноды, диск, память, load, место образов/томов |
+| `config` | values, security.yaml, .version (+ git-ветка инсталлятора), завершённость установки (.install_completed_steps.json), каталог данных, стеки swarm vs values |
+| `infra` | docker daemon, swarm, ноды, диск (место и иноды), память, load, место образов/томов |
 | `requirements` | CPU/RAM/диск/порты против минимумов из документации |
-| `services` | реплики, health и рестарты контейнеров, упавшие задачи, условные сервисы |
+| `services` | реплики, health и рестарты контейнеров, упавшие задачи, условные сервисы, rabbitmq (живость, очереди без потребителей, backlog), memcached (живость, evictions), websocket go_sender (realtime), звонки (UDP-порт jvb, TURN при force_relay), образы сервисов vs values |
 | `http` | главная страница, пути проектов, api_gateway /health, сроки сертификатов |
 | `security` | пароли по умолчанию в values, плейсхолдеры, опубликованные порты (mysql/rabbit наружу = FAIL), SSL-цепочка, маунты docker.sock |
-| `external` | license/push/registry/billing/SMTP, DNS с хоста и из контейнера |
+| `external` | license/push/registry/billing/SMTP, DNS с хоста и из контейнера, рассинхрон времени сервера (jwt/sso) |
 | `functional` | очередь автоудаления файлов, крон file-node, manticore |
 | `db` | mysql монолита и компаний (подключение, базы, версия, аптайм, потоки), репликация, manticore |
 | `kafka` | топики kafka (SIEM) |
 | `logs` | ошибки в логах по паттернам (FATAL, ERROR, OOM, panic, дедлоки, gone away, exit 255, refused, timeout), топ сервисов, самое частое сообщение, часы-пиков, примеры строк |
 | `backups` | свежесть и размер бэкапов |
 
-К строкам логов и к проблемам из сводки применяется база известных проблем `errors_kb.yaml`: для совпадений выводятся причина, лечение и ссылка на документацию. В сводке проблемы идут сначала FAIL, затем WARN.
+К строкам логов и к проблемам из сводки применяется база известных проблем `errors_kb.yaml`: для совпадений выводятся причина, лечение и ссылка на документацию. В сводке проблемы идут сначала FAIL, затем WARN. В шапке отчёта — git-версия самих инструментов.
 
 Пароли mysql подбираются автоматически: env контейнера → Docker Secrets → values.
 

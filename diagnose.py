@@ -17,8 +17,11 @@ import os
 import re
 import ssl
 import json
+import base64
 import socket
+import shlex
 import traceback
+import email.utils
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -64,6 +67,9 @@ LOG_FAIL_COUNT = 20
 # пороги для количества рестартов контейнера (за всё время жизни)
 RESTART_WARN_COUNT = 5
 RESTART_FAIL_COUNT = 20
+
+# порог неподобранного backlog очереди rabbitmq (сообщений)
+RABBIT_QUEUE_BACKLOG_WARN = 10000
 
 # пороги для свежести бэкапов (часов)
 BACKUP_WARN_HOURS = 48
@@ -439,6 +445,39 @@ def check_version_file(ctx):
     ctx.record("config", "версия инсталлятора", STATUS_OK, message)
 
 
+@check("config", "завершённость установки")
+def check_install_steps(ctx):
+    if not ctx.installer_dir:
+        ctx.record("config", "завершённость установки", STATUS_SKIP, "каталог инсталлятора не найден")
+        return
+
+    steps_path = Path(ctx.installer_dir) / ".install_completed_steps.json"
+    if not steps_path.exists():
+        ctx.record("config", "завершённость установки", STATUS_SKIP,
+                   "файл шагов установки не найден (установлено до появления трекинга шагов)")
+        return
+
+    try:
+        steps = json.loads(steps_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        ctx.record("config", "завершённость установки", STATUS_WARN, "файл шагов не читается: %s" % e)
+        return
+    if not isinstance(steps, list):
+        steps = []
+
+    # обязательные шаги install.py (activate_server опционален — локальная лицензия)
+    required = ["intall_monolith", "init_monolith", "create_team"]
+    missing = [step for step in required if step not in steps]
+
+    if missing:
+        ctx.record("config", "завершённость установки", STATUS_WARN,
+                   "установка не завершена — нет шагов: %s (окружение может быть недоразвёрнуто)" % ", ".join(missing))
+    elif steps:
+        ctx.record("config", "завершённость установки", STATUS_OK, "все шаги выполнены (%s)" % ", ".join(steps))
+    else:
+        ctx.record("config", "завершённость установки", STATUS_OK, "все шаги выполнены")
+
+
 @check("config", "каталог данных")
 def check_data_dir(ctx):
     root_mount_path = ctx.value("root_mount_path")
@@ -613,8 +652,18 @@ def check_disk(ctx):
         else:
             status = STATUS_OK
 
+        # иноды: переполнение ломает запись даже при свободном месте
+        inode_text = ""
+        if stat.f_files:
+            inode_free_percent = 100.0 * stat.f_ffree / stat.f_files
+            inode_text = ", иноды свободно %.1f%%" % inode_free_percent
+            if inode_free_percent < DISK_FREE_FAIL_PERCENT:
+                status = STATUS_FAIL
+            elif inode_free_percent < DISK_FREE_WARN_PERCENT and status != STATUS_FAIL:
+                status = STATUS_WARN
+
         ctx.record("infra", "диск %s" % path, status,
-                   "свободно %.1f%% (%.1f ГБ)" % (free_percent, free_gb))
+                   "свободно %.1f%% (%.1f ГБ)%s" % (free_percent, free_gb, inode_text))
 
 
 @check("infra", "память")
@@ -873,6 +922,310 @@ def check_conditional_services(ctx):
                        "есть в стеке, но выключен в конфиге (%s) — вероятно, нужен redeploy" % config_hint)
         else:
             ctx.record("services", "сервис *%s*" % prefix, STATUS_OK, "соответствует конфигу (%s)" % config_hint)
+
+
+@check("services", "rabbitmq: живость и очереди")
+def check_rabbit(ctx):
+    monolith_label = ctx.value("projects.monolith.label", "monolith")
+    stack = "%s-%s" % (ctx.stack_prefix, monolith_label)
+    if stack not in ctx.stacks():
+        ctx.record("services", "rabbitmq: живость и очереди", STATUS_SKIP, "стек %s не найден" % stack)
+        return
+
+    containers = find_containers(ctx, stack, "rabbit-")
+    if not containers:
+        ctx.record("services", "rabbitmq: живость и очереди", STATUS_FAIL, "контейнер rabbit не найден")
+        return
+    container = containers[0]
+
+    rc, out = exec_in_container(container, "rabbitmqctl ping", timeout=30)
+    if rc != 0:
+        ctx.record("services", "rabbitmq: живость и очереди", STATUS_FAIL, "rabbitmqctl ping: %s" % out.strip()[:200])
+        return
+
+    rc, out = exec_in_container(
+        container,
+        "rabbitmqctl list_queues --formatter json name messages messages_ready messages_unacknowledged consumers",
+        timeout=60,
+    )
+    queues = []
+    try:
+        # вывод может содержать служебные строки перед json
+        json_start = out.index("[")
+        queues = json.loads(out[json_start:])
+    except (ValueError, IndexError):
+        ctx.record("services", "rabbitmq: живость и очереди", STATUS_WARN,
+                   "жив, но не удалось разобрать list_queues: %s" % out.strip()[:200])
+        return
+
+    total_messages = 0
+    stuck = []      # очереди с сообщениями и без потребителей
+    backlog = []    # очереди с большим неподобранным backlog
+    for queue in queues:
+        ready = int(queue.get("messages_ready", 0) or 0)
+        unacked = int(queue.get("messages_unacknowledged", 0) or 0)
+        consumers = int(queue.get("consumers", 0) or 0)
+        total_messages += int(queue.get("messages", 0) or 0)
+
+        if consumers == 0 and ready > 100:
+            stuck.append("%s (ready=%d, потребителей нет)" % (queue.get("name", "?"), ready))
+        elif ready > RABBIT_QUEUE_BACKLOG_WARN:
+            backlog.append("%s (ready=%d)" % (queue.get("name", "?"), ready))
+        if unacked > RABBIT_QUEUE_BACKLOG_WARN:
+            backlog.append("%s (unacked=%d)" % (queue.get("name", "?"), unacked))
+
+    summary = "жив, очередей: %d, сообщений всего: %d" % (len(queues), total_messages)
+    if stuck:
+        ctx.record("services", "rabbitmq: живость и очереди", STATUS_FAIL,
+                   "%s; очереди без потребителей: %s — сервисы не разбирают очередь (проверьте go_sender/go_event)" % (
+                       summary, "; ".join(stuck[:4])))
+    elif backlog:
+        ctx.record("services", "rabbitmq: живость и очереди", STATUS_WARN,
+                   "%s; растущий backlog: %s" % (summary, "; ".join(backlog[:4])))
+    else:
+        ctx.record("services", "rabbitmq: живость и очереди", STATUS_OK, summary)
+
+
+@check("services", "memcached: кэш")
+def check_memcached(ctx):
+    monolith_label = ctx.value("projects.monolith.label", "monolith")
+    stack = "%s-%s" % (ctx.stack_prefix, monolith_label)
+    if stack not in ctx.stacks():
+        ctx.record("services", "memcached: кэш", STATUS_SKIP, "стек %s не найден" % stack)
+        return
+
+    php_containers = find_containers(ctx, stack, "php-monolith")
+    if not php_containers:
+        ctx.record("services", "memcached: кэш", STATUS_SKIP, "нет php-контейнера для проверки")
+        return
+
+    # стучимся из php-контейнера: в образе memcached нет инструментов для запросов
+    memcached_host = "memcached-%s" % monolith_label
+    php_code = (
+        '$s=@fsockopen("%s",11211,$errno,$errstr,3);'
+        'if(!$s){echo "CONNFAIL ".$errstr;exit(1);}'
+        'fwrite($s,"version\r\nstats\r\nquit\r\n");'
+        'echo stream_get_contents($s);'
+    ) % memcached_host
+    rc, out = exec_in_container(php_containers[0], "php -r %s" % shlex.quote(php_code), timeout=30)
+
+    if rc != 0 or "CONNFAIL" in out:
+        ctx.record("services", "memcached: кэш", STATUS_FAIL,
+                   "%s:%d не отвечает из php-контейнера: %s" % (memcached_host, 11211, out.strip()[:200]))
+        return
+
+    version = re.search(r"VERSION\s+([\d.]+)", out)
+    curr_items = re.search(r"STAT curr_items (\d+)", out)
+    evictions = re.search(r"STAT evictions (\d+)", out)
+    bytes_used = re.search(r"STAT bytes (\d+)", out)
+    max_bytes = re.search(r"STAT limit_maxbytes (\d+)", out)
+
+    parts = ["жив (v%s), объектов: %s" % (
+        version.group(1) if version else "?",
+        curr_items.group(1) if curr_items else "?",
+    )]
+    if bytes_used and max_bytes and int(max_bytes.group(1)):
+        fill = 100.0 * int(bytes_used.group(1)) / int(max_bytes.group(1))
+        parts.append("заполнен %.0f%%" % fill)
+    else:
+        fill = 0
+
+    evictions_count = int(evictions.group(1)) if evictions else 0
+    if evictions_count > 0:
+        ctx.record("services", "memcached: кэш", STATUS_WARN,
+                   "%s, evictions: %d — кэш мал, данные вытесняются (падение производительности)" % (
+                       ", ".join(parts), evictions_count))
+    elif fill > 90:
+        ctx.record("services", "memcached: кэш", STATUS_WARN, "%s — почти заполнен" % ", ".join(parts))
+    else:
+        ctx.record("services", "memcached: кэш", STATUS_OK, ", ".join(parts))
+
+
+# послать websocket-upgrade на host:port/path; вернуть (код, первая строка ответа) или (None, ошибка)
+def ws_upgrade_probe(host, port, path, sni_host=None):
+    ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+    request = (
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    ) % (path, host, ws_key)
+    try:
+        raw_socket = socket.create_connection((host, port), timeout=args.http_timeout)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        tls_socket = context.wrap_socket(raw_socket, server_hostname=sni_host or host)
+        tls_socket.settimeout(args.http_timeout)
+        tls_socket.sendall(request.encode("ascii"))
+        response = tls_socket.recv(256).decode("utf-8", "ignore")
+        tls_socket.close()
+    except Exception as e:
+        return None, str(e)
+
+    first_line = response.splitlines()[0] if response else ""
+    code_match = re.search(r"HTTP/[\d.]+\s+(\d{3})", first_line)
+    return (int(code_match.group(1)) if code_match else None), first_line
+
+
+@check("services", "websocket go_sender (realtime)")
+def check_go_sender_ws(ctx):
+    if not ctx.values_loaded or not ctx.value("host"):
+        ctx.record("services", "websocket go_sender (realtime)", STATUS_SKIP, "values не загружены")
+        return
+
+    host = ctx.value("host")
+    ws_port = int(ctx.value("nginx.websocket_port") or 0)
+    if ws_port in (0, 80, 443):
+        ws_port = main_external_port(ctx)
+
+    # путь pivot /ws и /ws0, домино — /<label>/ws; нас устраивает любой, поднявший upgrade
+    candidate_paths = ["/ws", "/ws0"]
+    for domino_config in (ctx.value("projects.domino") or {}).values():
+        label = (domino_config or {}).get("label") if isinstance(domino_config, dict) else None
+        if label:
+            candidate_paths.append("/%s/ws" % label)
+
+    for path in candidate_paths:
+        code, first_line = ws_upgrade_probe(host, ws_port, path)
+        if code == 101:
+            ctx.record("services", "websocket go_sender (realtime)", STATUS_OK,
+                       "upgrade ок: %s:%d%s" % (host, ws_port, path))
+            return
+        if code is None:
+            # host из values недоступен — фолбэк на локальный порт с SNI=host
+            code_local, first_local = ws_upgrade_probe("127.0.0.1", main_external_port(ctx), path, sni_host=host)
+            if code_local == 101:
+                ctx.record("services", "websocket go_sender (realtime)", STATUS_WARN,
+                           "%s:%d%s — host из values недоступен, но локально upgrade проходит — проверьте доступность host" % (
+                               host, ws_port, path))
+                return
+            break  # сетевая ошибка одинакова для всех путей
+
+    ctx.record("services", "websocket go_sender (realtime)", STATUS_FAIL,
+               "websocket не поднимается (%s:%d, ответ: %s) — realtime-доставка сообщений не работает" % (
+                   host, ws_port, (first_line or "нет ответа")[:120]))
+
+
+@check("services", "звонки: медиа-порт UDP jvb")
+def check_calls_udp(ctx):
+    media_port = int(ctx.value("projects.jitsi.service.jvb.media_port") or 10000)
+
+    rc, out, _ = run_cmd(["ss", "-lun"], timeout=15)
+    if rc != 0:
+        ctx.record("services", "звонки: медиа-порт UDP jvb", STATUS_SKIP, "ss не выполнился")
+        return
+
+    # слушается ли порт на любом адресе (jvb работает в host-сети)
+    if re.search(r":%d\s" % media_port, out):
+        ctx.record("services", "звонки: медиа-порт UDP jvb", STATUS_OK, "UDP %d слушается (jvb)" % media_port)
+    else:
+        ctx.record("services", "звонки: медиа-порт UDP jvb", STATUS_FAIL,
+                   "UDP %d не слушается — jvb не поднялся или порт закрыт; медиа в звонках не пойдёт" % media_port)
+
+
+@check("services", "звонки: TURN")
+def check_calls_turn(ctx):
+    if not ctx.values_loaded:
+        ctx.record("services", "звонки: TURN", STATUS_SKIP, "values не загружены")
+        return
+
+    turn_config = ctx.value("projects.jitsi.service.turn") or {}
+    if not isinstance(turn_config, dict):
+        turn_config = {}
+
+    force_relay = bool(turn_config.get("force_relay", True))
+    turn_host = turn_config.get("host") or ""
+    turn_port = int(turn_config.get("port") or 3478)
+    turn_tls_port = int(turn_config.get("tls_port") or 5349)
+
+    if not turn_host:
+        if force_relay:
+            ctx.record("services", "звонки: TURN", STATUS_FAIL,
+                       "force_relay=true (весь медиатрафик через TURN), но turn.host пуст — "
+                       "медиа в звонках не пойдёт ни у кого; настройте coturn и заполните projects.jitsi.service.turn")
+        else:
+            ctx.record("services", "звонки: TURN", STATUS_SKIP,
+                       "TURN не задан; при force_relay=false допустимо (прямой UDP к jvb)")
+        return
+
+    # доступность coturn по tcp с этого сервера
+    reachable = []
+    for port, label in ((turn_port, "tcp/%d" % turn_port), (turn_tls_port, "tcp/%d (tls)" % turn_tls_port)):
+        try:
+            probe = socket.create_connection((turn_host, port), timeout=args.http_timeout)
+            probe.close()
+            reachable.append(label)
+        except Exception:
+            pass
+
+    if not reachable:
+        status = STATUS_FAIL if force_relay else STATUS_WARN
+        ctx.record("services", "звонки: TURN", status,
+                   "%s не отвечает на %d и %d (tcp) — проверьте coturn и фаервол" % (
+                       turn_host, turn_port, turn_tls_port))
+    else:
+        relay_note = ", весь медиатрафик идёт через него (force_relay=true)" if force_relay else ""
+        ctx.record("services", "звонки: TURN", STATUS_OK,
+                   "%s доступен (%s)%s" % (turn_host, ", ".join(reachable), relay_note))
+
+
+@check("services", "образы сервисов vs values")
+def check_images_vs_values(ctx):
+    if not ctx.values_loaded:
+        ctx.record("services", "образы сервисов vs values", STATUS_SKIP, "values не загружены")
+        return
+
+    # карта: нормализованный ключ сервиса (с дефисами) -> тег из values
+    tag_map = {}
+    for project_config in (ctx.value("projects") or {}).values():
+        services = (project_config or {}).get("service") if isinstance(project_config, dict) else None
+        if not isinstance(services, dict):
+            continue
+        for service_key, service_config in services.items():
+            tag = service_config.get("tag") if isinstance(service_config, dict) else None
+            if tag:
+                tag_map[str(service_key).replace("_", "-")] = str(tag)
+
+    if not tag_map:
+        ctx.record("services", "образы сервисов vs values", STATUS_SKIP, "в values нет тегов сервисов")
+        return
+
+    mismatches = []
+    checked = 0
+    for stack in ctx.stacks():
+        for service in ctx.stack_services(stack):
+            short_name = short_service_name(ctx, stack, service.get("Name", ""))
+            image = service.get("Image", "")
+            if ":" not in image:
+                continue
+
+            # самый длинный ключ, входящий в имя сервиса (go-sender-balancer точнее go-sender)
+            matched_key = None
+            for key in sorted(tag_map, key=len, reverse=True):
+                if key in short_name:
+                    matched_key = key
+                    break
+            if matched_key is None:
+                continue
+
+            checked += 1
+            image_tag = image.rsplit(":", 1)[1]
+            if image_tag != tag_map[matched_key]:
+                mismatches.append("%s: образ %s, values %s" % (short_name, image_tag, tag_map[matched_key]))
+
+    if not checked:
+        ctx.record("services", "образы сервисов vs values", STATUS_SKIP, "сопоставлений со значениями values не найдено")
+    elif mismatches:
+        ctx.record("services", "образы сервисов vs values", STATUS_WARN,
+                   "запущенные образы отличаются от values (%d из %d): %s — redeploy не выполнен или откат" % (
+                       len(mismatches), checked, "; ".join(mismatches[:5])))
+    else:
+        ctx.record("services", "образы сервисов vs values", STATUS_OK,
+                   "все запущенные образы соответствуют values (%d сервисов)" % checked)
 
 
 # ---ПРОВЕРКИ: HTTP---#
@@ -1659,6 +2012,38 @@ def check_external_smtp(ctx):
                        smtp_host, smtp_port, error_summary(str(e))))
 
 
+@check("external", "время сервера")
+def check_server_time(ctx):
+    # рассинхрон времени ломает jwt/sso-авторизацию; сверяемся с Date внешнего сервера
+    try:
+        response = requests.get("https://license.getcompass.ru/", timeout=args.http_timeout, verify=False)
+    except Exception as e:
+        ctx.record("external", "время сервера", STATUS_SKIP, "нет доступа к внешнему серверу для сверки: %s" % str(e)[:120])
+        return
+
+    date_header = response.headers.get("Date", "")
+    if not date_header:
+        ctx.record("external", "время сервера", STATUS_SKIP, "внешний сервер не отдал Date")
+        return
+
+    try:
+        remote_time = email.utils.parsedate_to_datetime(date_header)
+    except (TypeError, ValueError):
+        ctx.record("external", "время сервера", STATUS_SKIP, "не удалось разобрать Date: %r" % date_header)
+        return
+
+    drift_seconds = abs((datetime.now(timezone.utc) - remote_time).total_seconds())
+
+    if drift_seconds > 1800:
+        ctx.record("external", "время сервера", STATUS_FAIL,
+                   "расхождение с внешним сервером %.0f сек — jwt/sso-авторизация будет ломаться; настройте синхронизацию времени (chrony/ntp)" % drift_seconds)
+    elif drift_seconds > 120:
+        ctx.record("external", "время сервера", STATUS_WARN,
+                   "расхождение с внешним сервером %.0f сек — проверьте синхронизацию времени (chrony/ntp)" % drift_seconds)
+    else:
+        ctx.record("external", "время сервера", STATUS_OK, "расхождение %.0f сек" % drift_seconds)
+
+
 # ---ПРОВЕРКИ: DNS (хост и контейнеры)---#
 
 # имена, которые обязан резолвить хост: лицензия + собственный домен из values
@@ -2122,6 +2507,14 @@ def check_kafka_topics(ctx):
 
 # ---ПРОВЕРКИ: ЛОГИ---#
 
+# отрезать служебный префикс docker ("<task>@<host>    | <сообщение>")
+def strip_log_prefix(line):
+    head, separator, tail = line.partition("|")
+    if separator and "@" in head and tail.strip():
+        return tail.strip()
+    return line.strip()
+
+
 @check("logs", "ошибки в логах сервисов")
 def check_logs(ctx):
     kb_entries = load_errors_kb()
@@ -2156,11 +2549,12 @@ def check_logs(ctx):
                 for pattern_name in matched:
                     found_counts[pattern_name] = found_counts.get(pattern_name, 0) + 1
                 if len(samples) < LOG_SAMPLES_PER_SERVICE:
-                    samples.append(line.strip()[:300])
+                    samples.append(strip_log_prefix(line)[:300])
 
                 # самое частое сообщение: цифры -> N схлопываем
-                key = re.sub(r"\d+", "N", line.strip()[:300])
-                item = top_messages.setdefault(key, [0, line.strip()[:300]])
+                clean_line = strip_log_prefix(line)[:300]
+                key = re.sub(r"\d+", "N", clean_line)
+                item = top_messages.setdefault(key, [0, clean_line])
                 item[0] += 1
 
                 # час строки (docker: "service.1.abc@2026-08-27T10:12:34...")
@@ -2375,6 +2769,17 @@ def build_json_report(ctx):
 
 # ---ТОЧКА ВХОДА---#
 
+def tools_revision():
+    # git-коммит самих инструментов — чтобы по отчёту понимать, какой версией снят
+    try:
+        rc, out, _ = run_cmd(["git", "-C", str(Path(__file__).resolve().parent), "log", "--oneline", "-1"], timeout=10)
+    except Exception:
+        return ""
+    if rc == 0 and out.strip():
+        return out.strip()
+    return ""
+
+
 def main():
     ctx = DiagnoseContext()
 
@@ -2385,6 +2790,7 @@ def main():
         print_line("")
         print_line(blue("Диагностика Compass On-premise"))
         print_line("  Сервер:          %s" % get_hostname())
+        print_line("  Инструменты:     %s" % (tools_revision() or "неизвестно (не из git)"))
         print_line("  Каталог:         %s" % ctx.installer_dir)
         print_line("  Окружение:       %s (values: %s)" % (ctx.environment, ctx.values_name))
         print_line("  Префикс стеков:  %s" % (ctx.stack_prefix if ctx.values_loaded else "неизвестен (values не загружены)"))
