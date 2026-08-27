@@ -999,10 +999,11 @@ def check_memcached(ctx):
         ctx.record("services", "memcached: кэш", STATUS_SKIP, "нет php-контейнера для проверки")
         return
 
-    # стучимся из php-контейнера: в образе memcached нет инструментов для запросов
+    # стучимся из php-контейнера (в образе memcached нет инструментов);
+    # fsockopen в php-образе Compass отключён (disable_functions) — используем stream_socket_client
     memcached_host = "memcached-%s" % monolith_label
     php_code = (
-        '$s=@fsockopen("%s",11211,$errno,$errstr,3);'
+        '$s=@stream_socket_client("tcp://%s:11211",$errno,$errstr,3);'
         'if(!$s){echo "CONNFAIL ".$errstr;exit(1);}'
         'fwrite($s,"version\r\nstats\r\nquit\r\n");'
         'echo stream_get_contents($s);'
@@ -1089,21 +1090,34 @@ def check_go_sender_ws(ctx):
         if label:
             candidate_paths.append("/%s/ws" % label)
 
+    # проход 1: по host из values
+    network_unreachable = True
     for path in candidate_paths:
         code, first_line = ws_upgrade_probe(host, ws_port, path)
         if code == 101:
             ctx.record("services", "websocket go_sender (realtime)", STATUS_OK,
                        "upgrade ок: %s:%d%s" % (host, ws_port, path))
             return
-        if code is None:
-            # host из values недоступен — фолбэк на локальный порт с SNI=host
-            code_local, first_local = ws_upgrade_probe("127.0.0.1", main_external_port(ctx), path, sni_host=host)
+        if code is not None:
+            network_unreachable = False  # host отвечает — просто путь не подошёл
+
+    # проход 2: host из values недоступен — все пути локально, с SNI=host
+    if network_unreachable:
+        first_local = ""
+        for path in candidate_paths:
+            code_local, first_local = ws_upgrade_probe(
+                "127.0.0.1", main_external_port(ctx), path, sni_host=host)
             if code_local == 101:
                 ctx.record("services", "websocket go_sender (realtime)", STATUS_WARN,
                            "%s:%d%s — host из values недоступен, но локально upgrade проходит — проверьте доступность host" % (
                                host, ws_port, path))
                 return
-            break  # сетевая ошибка одинакова для всех путей
+        ctx.record("services", "websocket go_sender (realtime)", STATUS_FAIL,
+                   "websocket не поднимается: %s:%d недоступен (%s), локально на 127.0.0.1:%d ответ: %s — "
+                   "realtime-доставка сообщений не работает" % (
+                       host, ws_port, (first_line or "нет ответа")[:80], main_external_port(ctx),
+                       (first_local or "нет ответа")[:80]))
+        return
 
     ctx.record("services", "websocket go_sender (realtime)", STATUS_FAIL,
                "websocket не поднимается (%s:%d, ответ: %s) — realtime-доставка сообщений не работает" % (
