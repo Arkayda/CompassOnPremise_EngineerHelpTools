@@ -132,8 +132,9 @@ def main():
                     if len(entry[1]) < args.samples:
                         entry[1].append(line.strip()[:400])
 
-            # строка уже похожа на ошибку — прогоняем через базу знаний
-            if matched_any and kb_entries:
+            # базу знаний проверяем на каждой строке: сообщения инсталлера
+            # ("не удалось развернуть проект") не содержат FATAL/ERROR
+            if kb_entries:
                 kb_entry = match_error_kb(kb_entries, line)
                 if kb_entry:
                     item = kb_stats.setdefault(kb_entry["id"], {

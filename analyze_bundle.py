@@ -555,14 +555,15 @@ def analyze_logs(bundle_dir):
                     if len(samples[(service_name, pattern_name)]) < args.samples:
                         samples[(service_name, pattern_name)].append(clean_line.strip()[:300])
                     matched_any = True
-            if not matched_any:
-                continue
-
-            # строка уже похожа на ошибку — сверяем с базой известных проблем
+            # базу знаний проверяем на каждой строке: сообщения инсталлера
+            # ("не удалось развернуть проект") не содержат FATAL/ERROR
             if kb_entries:
                 kb_entry = match_error_kb(kb_entries, clean_line)
                 if kb_entry:
                     kb_hits[service_name][kb_entry["id"]] += 1
+
+            if not matched_any:
+                continue
 
             hour = extract_hour(clean_line)
             if hour:

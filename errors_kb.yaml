@@ -9,8 +9,9 @@
 #   fix      — что делать
 #   doc      — ссылка на документацию
 #
-# Паттерны пишем узко: база срабатывает только на строках, уже совпавших
-# с общими паттернами ошибок (FATAL/ERROR/...), ложных срабатываний быть не должно.
+# Паттерны пишем узко: база проверяется на каждой строке лога (не только на строках
+# с FATAL/ERROR — сообщения инсталлятора на русском их не содержат), поэтому паттерн
+# должен быть достаточно специфичным, чтобы не ловить ложные совпадения.
 
 entries:
 
@@ -37,20 +38,6 @@ entries:
       pip3 install docker (или --break-system-packages) либо запустить скрипты
       через .venv инсталлятора: init-install/init.py поднимает окружение сам.
     doc: "https://doc-onpremise.getcompass.ru/troubleshooting.html"
-
-  - id: php-monolith-wont-start
-    title: "php_monolith не поднимается / постоянно падает"
-    patterns:
-      - "php[-_]monolith.*(restart|fall|падает|не поднялся)"
-      - "php[-_]monolith.*OOMKilled"
-    severity: crit
-    cause: >-
-      Чаще всего сервер не соответствует минимальным требованиям:
-      12 vCPU, 20 ГБ RAM, SSD 200 ГБ, случайное чтение ~1200 IOPS.
-    fix: >-
-      Проверить ресурсы (lscpu, free -h, df -h), замерить диск (fio),
-      посмотреть docker service ps и docker service logs php-monolith.
-    doc: "https://doc-onpremise.getcompass.ru/requirements.html"
 
   - id: activation-server-unreachable
     title: "Не удалось активировать сервер: недоступен по адресу"
@@ -251,3 +238,604 @@ entries:
     cause: "Сервер инсталляции не может выйти на license.getcompass.ru (443) — firewall/DNS/прокси."
     fix: "Проверить с сервера: curl -v https://license.getcompass.ru/; открыть исходящий 443/tcp."
     doc: "https://doc-onpremise.getcompass.ru/faq.html"
+
+  # === импорт из вики-каталога errors/catalog.md (этапы: activate, all, app_init, db_config, deploy, migrations, nginx_deploy, replication, root_user, team, triggers, uninstall, update) ===
+
+  - id: wiki-install-deploy-app
+    title: 'Ошибка при разворачивании приложения (INSTALL-DEPLOY-APP) [частая]'
+    patterns:
+      - 'Ошибка\ при\ разворачивании\ приложения'
+      - 'Ошибка\ при\ разворачивании\ интеграции'
+    severity: crit
+    cause: >-
+      Swarm не активен, недоступен реестр образов, нет certs/security, конфликт портов/сетей.
+    fix: >-
+      docker info (Swarm active), docker swarm init; проверить доступ к docker.getcompass.ru; наличие certs/ и src/security.yaml; освободить порты. Связанные: DEPLOY-NO-CERTS, DEPLOY-NO-SECURITY, DEPLOY-STACK-FAILED
+    # источник в инсталлере: script/install.py:475,496; update.py:643,664; deploy.py:499 («не удалось развернуть проект») Условие: deploy.py / docker stack deploy вернул != 0.; этап deploy
+
+  - id: wiki-deploy-no-certs
+    title: 'Не сгенерированы сертификаты для серверов, запустите скрипт generat... (DEPLOY-NO-CERTS)'
+    patterns:
+      - 'Не\ сгенерированы\ сертификаты\ для\ серверов,\ запустите\ скрипт\ generate_ssl_certificates\.py'
+    severity: crit
+    cause: >-
+      deploy запущен без предварительного generate_ssl_certificates.py.
+    fix: >-
+      Запустить generate_ssl_certificates.py. Exit code: 1
+    # источник в инсталлере: script/deploy.py:296-301 Условие: Не существует папки certs/.; этап deploy
+
+  - id: wiki-deploy-no-security
+    title: 'Не создан файл с ключами безопасности. Запустите скрипт generate_se... (DEPLOY-NO-SECURITY)'
+    patterns:
+      - 'Не\ создан\ файл\ с\ ключами\ безопасности\.\ Запустите\ скрипт\ generate_security_keys\.py'
+    severity: crit
+    cause: >-
+      Пропущен generate_security_keys.py.
+    fix: >-
+      Запустить generate_security_keys.py. Exit code: 1
+    # источник в инсталлере: script/deploy.py:332-337 Условие: Нет ни src/security.yaml, ни root_mount_path/security.yaml.; этап deploy
+
+  - id: wiki-deploy-template
+    title: 'не удалось сгенерировать шаблон файла композиции (DEPLOY-TEMPLATE)'
+    patterns:
+      - 'не\ удалось\ сгенерировать\ шаблон\ файла\ композиции'
+      - '\.\.\.файла\ перезаписи\ композиции'
+      - '\.\.\.файла\ sidecar\ контейнеров'
+    severity: crit
+    cause: >-
+      Ошибка в .goyaml-шаблоне или в значениях values.
+    fix: >-
+      Проверить шаблоны src/<project>/compose*.goyaml и values.
+    # источник в инсталлере: script/deploy.py:400,420,441 Условие: template.py для compose вернул != 0.; этап deploy
+
+  - id: wiki-deploy-stack-failed
+    title: 'не удалось развернуть проект (DEPLOY-STACK-FAILED) [частая]'
+    patterns:
+      - 'не\ удалось\ развернуть\ проект'
+    severity: crit
+    cause: >-
+      Swarm не активен, нет образов, конфликт портов/сетей.
+    fix: >-
+      docker swarm init; проверить доступ к registry; освободить порты; docker stack deploy вручную для деталей.
+    # источник в инсталлере: script/deploy.py:499 Условие: docker stack deploy вернул != 0.; этап deploy
+
+  - id: wiki-template-unsupported-os
+    title: '(нет текста — exit 1) (TEMPLATE-UNSUPPORTED-OS)'
+    patterns:
+      - '\(нет\ текста\ —\ exit\ 1\)'
+    severity: crit
+    cause: >-
+      Неподдерживаемая платформа для бинаря go_template.
+    fix: >-
+      Запускать на Linux (или macOS для разработки). Exit code: 1
+    # источник в инсталлере: script/template.py:17 Условие: sys.platform не linux и не darwin.; этап deploy
+
+  - id: wiki-monolith-not-healthy
+    title: 'php_monolith не поднялся (loader: php_monolith не может подняться) (MONOLITH-NOT-HEALTHY) [частая]'
+    patterns:
+      - 'php_monolith не может подняться'
+      - 'php_monolith не поднялся'
+      - 'php_monolith\ не\ поднялся\ \(loader:\ php_monolith\ не\ может\ подняться\)'
+    severity: crit
+    cause: >-
+      Падение монолита: БД недоступна, неверная конфигурация, нехватка ресурсов.
+    fix: >-
+      docker service logs <stack>_php-monolith; проверить mysql/конфиги/ресурсы. Связанные: DB-UNAVAILABLE
+    # источник в инсталлере: script/install.py:523; update.py:719 Условие: Контейнер <stack>_php-monolith не стал healthy за 1800с.; этап deploy
+
+  - id: wiki-nginx-not-healthy
+    title: 'nginx не поднялся (NGINX-NOT-HEALTHY)'
+    patterns:
+      - 'nginx\ не\ поднялся'
+    severity: crit
+    cause: >-
+      Ошибка nginx-конфига внутри стека / зависимость от монолита.
+    fix: >-
+      docker service logs <stack>_nginx; проверить конфиг nginx и upstream-зависимости.
+    # источник в инсталлере: script/install.py:559; update.py:758-797 Условие: Контейнер <stack>_nginx не стал healthy за 320с.; этап deploy
+
+  - id: wiki-nginx-sites-enabled-rm
+    title: 'Не смогли удалить папку /etc/nginx/sites-enabled (NGINX-SITES-ENABLED-RM)'
+    patterns:
+      - 'Не\ смогли\ удалить\ папку\ /etc/nginx/sites\-enabled'
+    severity: crit
+    cause: >-
+      Права/занятость пути.
+    fix: >-
+      Проверить права на /etc/nginx; снять блокировку/симлинк вручную. Exit code: 1
+    # источник в инсталлере: script/deploy_nginx.py:177-178; deploy_nginx_monolith.py:160-161 Условие: Исключение при rm -r /etc/nginx/sites-enabled на не-RPM ОС.; этап nginx_deploy
+
+  - id: wiki-nginx-reload-failed
+    title: '(stderr/stdout от nginx -s reload; loader: В конфигурации nginx ест... (NGINX-RELOAD-FAILED)'
+    patterns:
+      - '\(stderr/stdout\ от\ nginx\ \-s\ reload;\ loader:\ В\ конфигурации\ nginx\ есть\ ошибка\)'
+    severity: crit
+    cause: >-
+      Невалидный сгенерированный nginx-конфиг (отсутствуют серты, неверные include, конфликт с системным конфигом).
+    fix: >-
+      nginx -t; проверить /etc/nginx/sites-enabled/*, сертификаты в /etc/nginx/ssl.
+    # источник в инсталлере: script/deploy_nginx.py:192-197; deploy_nginx_monolith.py:175-180 Условие: nginx -s reload вернул != 0.; этап nginx_deploy
+
+  - id: wiki-app-init-no-www-data
+    title: 'Необходимо создать пользователя окруженияwww-data (APP-INIT-NO-WWW-DATA)'
+    patterns:
+      - 'Необходимо\ создать\ пользователя\ окруженияwww\-data'
+    severity: crit
+    cause: >-
+      Системный пользователь www-data не создан.
+    fix: >-
+      Выполнить create_www_data.py. Связанные: WWW-DATA-USERADD
+    # источник в инсталлере: script/init_pivot.py:65; init_premise.py:75; create_root_user.py:131-132; activate_server.py:44 Условие: pwd.getpwnam('www-data') -> KeyError.; этап app_init
+
+  - id: wiki-app-init-default-files
+    title: 'В docker-контейнере монолита отсутствуют default-файлы приложения (APP-INIT-DEFAULT-FILES)'
+    patterns:
+      - 'В\ docker\-контейнере\ монолита\ отсутствуют\ default\-файлы\ приложения'
+    severity: warn
+    cause: >-
+      Контейнер default_file (default-file-pivot) не отработал/не смонтировал дефолтные файлы.
+    fix: >-
+      Проверить сервис default_file, volume default-file; перезапустить деплой. Примечание: Только print error, выполнение продолжается.
+    # источник в инсталлере: script/init_pivot.py:92 Условие: wait_default_files.php вернул != 0.; этап app_init
+
+  - id: wiki-app-init-script-failed
+    title: 'Что-то пошло не так. Выполнение одного из скриптов завершилось неуд... (APP-INIT-SCRIPT-FAILED)'
+    patterns:
+      - 'Что\-то\ пошло\ не\ так\.\ Выполнение\ одного\ из\ скриптов\ завершилось\ неудачей'
+    severity: crit
+    cause: >-
+      Ошибка в приложении (БД/конфиг/активация).
+    fix: >-
+      Изучить вывод; проверить БД, конфиги, healthy monolith. Exit code: 1
+    # источник в инсталлере: script/init_pivot.py:130-131 Условие: Любой PHP-скрипт инициализации вернул != 0.; этап app_init
+
+  - id: wiki-init-premise-no-values
+    title: 'Не найден файл со сгенерированными значениями. Вы развернули прилож... (INIT-PREMISE-NO-VALUES)'
+    patterns:
+      - 'Не\ найден\ файл\ со\ сгенерированными\ значениями\.\ Вы\ развернули\ приложение\?'
+      - 'Не\ был\ развернут\ проект\ domino\ через\ скрипт\ deploy\.py'
+    severity: crit
+    cause: >-
+      Приложение не развёрнуто или domino не развёрнут.
+    fix: >-
+      Выполнить deploy.py для monolith/domino.
+    # источник в инсталлере: script/init_premise.py:42,51,54,59 Условие: Нет src/values.compass.yaml / нет domino в projects.; этап app_init
+
+  - id: wiki-rootuser-no-values
+    title: 'Не найден файл со сгенерированными значениями. Убедитесь, что прило... (ROOTUSER-NO-VALUES)'
+    patterns:
+      - 'Не\ найден\ файл\ со\ сгенерированными\ значениями\.\ Убедитесь,\ что\ приложение\ развернуто'
+    severity: crit
+    cause: >-
+      Приложение не развёрнуто / неверный -v.
+    fix: >-
+      Развернуть приложение; проверить -v/--values.
+    # источник в инсталлере: script/create_root_user.py:87,100 Условие: Нет/пуст src/values.*.yaml (не в validate).; этап root_user
+
+  - id: wiki-team-no-values
+    title: 'Не найден файл со сгенерированными значениями. Убедитесь, что прило... (TEAM-NO-VALUES)'
+    patterns:
+      - 'Не\ найден\ файл\ со\ сгенерированными\ значениями\.\ Убедитесь,\ что\ приложение\ развернуто'
+      - 'Не\ был\ развернут\ проект\ domino\ через\ скрипт\ deploy\.py'
+    severity: crit
+    cause: >-
+      Приложение/domino не развёрнуты.
+    fix: >-
+      Выполнить deploy.py (monolith и domino).
+    # источник в инсталлере: script/create_team.py:241,254,260,267 Условие: Нет values / нет domino в projects.; этап team
+
+  - id: wiki-team-ports-replication
+    title: 'Конечный порт не может быть меньше начального (TEAM-PORTS-REPLICATION)'
+    patterns:
+      - 'Конечный\ порт\ не\ может\ быть\ меньше\ начального'
+      - 'При\ включенной\ репликации\ необходимо\ передавать\ параметр\ \-dst\ при\ создании\ команды'
+    severity: crit
+    cause: >-
+      Неверный диапазон портов; нет получателя бэкапа при репликации.
+    fix: >-
+      Исправить диапазон портов; передать -dst <dest>.
+    # источник в инсталлере: script/create_team.py:131-133,309-310 Условие: end_port < start_port; либо репликация (master, не init) без -dst.; этап team
+
+  - id: wiki-db-read
+    title: 'Не смогли прочитать конфигурацию {database.yaml}. Поправьте её и за... (DB-READ)'
+    patterns:
+      - 'Не\ смогли\ прочитать\ конфигурацию\ .+?\.\ Поправьте\ её\ и\ запустите\ установку\ снова'
+    severity: crit
+    cause: >-
+      Битый/невалидный YAML.
+    fix: >-
+      Исправить синтаксис database.yaml.
+    # источник в инсталлере: script/validate_db_configuration.py:68-70 Условие: Исключение при парсинге yaml.; этап db_config
+
+  - id: wiki-db-driver
+    title: 'Указан неподдерживаемый драйвер в параметрах подключения к БД (DB-DRIVER)'
+    patterns:
+      - 'Указан\ неподдерживаемый\ драйвер\ в\ параметрах\ подключения\ к\ БД'
+    severity: crit
+    cause: >-
+      Опечатка/неверный driver.
+    fix: >-
+      Указать driver: docker или host.
+    # источник в инсталлере: script/validate_db_configuration.py:107-108 Условие: driver не из [docker, host].; этап db_config
+
+  - id: wiki-db-format
+    title: 'Неверный формат конфигурации для БД (DB-FORMAT)'
+    patterns:
+      - 'Неверный\ формат\ конфигурации\ для\ БД'
+    severity: crit
+    cause: >-
+      Некорректная структура host-конфига.
+    fix: >-
+      Привести driver_data к схеме (project_mysql_hosts.monolith + company_mysql_hosts[]).
+    # источник в инсталлере: script/validate_db_configuration.py:139,144,158 Условие: Для host: driver_data не dict / нет project_mysql_hosts / company_mysql_hosts не список.; этап db_config
+
+  - id: wiki-db-unavailable
+    title: 'Указанный инстанс MySQL в конфигурации недоступен: <host:port> (DB-UNAVAILABLE) [частая]'
+    patterns:
+      - 'Указанный\ инстанс\ MySQL\ в\ конфигурации\ недоступен:\ <host:port>'
+    severity: crit
+    cause: >-
+      MySQL не запущен/не слушает, неверный host/port, неверный root-пароль, сеть/файрвол, неверный bind-address.
+    fix: >-
+      mysql -h host -P port -uroot -p; проверить сеть, пароль root, bind-address, файрвол.
+    # источник в инсталлере: script/validate_db_configuration.py:228-229 (is_database_available) Условие: Не удалось подключиться к MySQL (timeout 2с, user root, заданный пароль).; этап db_config
+
+  - id: wiki-db-duplicates
+    title: 'В конфигурации найдены дублирующиеся параметры подключения к БД: <l... (DB-DUPLICATES)'
+    patterns:
+      - 'В\ конфигурации\ найдены\ дублирующиеся\ параметры\ подключения\ к\ БД:\ <list>'
+    severity: crit
+    cause: >-
+      Повтор подключения.
+    fix: >-
+      Убрать дубликаты host:port.
+    # источник в инсталлере: script/validate_db_configuration.py:124-126 Условие: Одинаковые host:port у разных инстансов.; этап db_config
+
+  - id: wiki-db-count
+    title: 'Неверно указано число БД для команд (DB-COUNT)'
+    patterns:
+      - 'Неверно\ указано\ число\ БД\ для\ команд'
+    severity: crit
+    cause: >-
+      Пустой или слишком большой список БД компаний.
+    fix: >-
+      Указать 1..15 БД для команд.
+    # источник в инсталлере: script/validate_db_configuration.py:173-174 Условие: Кол-во company_mysql_hosts <= 0 или > 15.; этап db_config
+
+  - id: wiki-db-lock-incompatible
+    title: 'Не совпадает драйвер БД в новой и имеющейся конфигурации (DB-LOCK-INCOMPATIBLE)'
+    patterns:
+      - 'Не\ совпадает\ драйвер\ БД\ в\ новой\ и\ имеющейся\ конфигурации'
+      - 'Не\ совпадает\ конфигурация\ БД\ \.\.\.\ для\ проекта\ monolith'
+      - 'Новая\ конфигурация\ БД\ команды\ не\ содержит\ уже\ имеющееся\ подключение\ <uniq>'
+    severity: crit
+    cause: >-
+      Попытка несовместимо изменить БД после первого деплоя.
+    fix: >-
+      Вернуть совместимость с lock-файлом; БД менять только расширением (добавлением), не удаляя/меняя существующие.
+    # источник в инсталлере: script/validate_db_configuration.py:255,289,317 Условие: Новый конфиг противоречит database.lock.yaml (сменён драйвер, изменён monolith, пропало раннее подключение).; этап db_config
+
+  - id: wiki-db-no-block
+    title: 'Не найден блок параметров подключения к БД (DB-NO-BLOCK)'
+    patterns:
+      - 'Не\ найден\ блок\ параметров\ подключения\ к\ БД'
+      - 'Не\ найден\ блок\ параметров\ шифрования\ БД'
+    severity: crit
+    cause: >-
+      Неполный конфиг.
+    fix: >-
+      Добавить недостающие блоки в database.yaml.
+    # источник в инсталлере: script/validate_db_configuration.py:431,457 Условие: В database.yaml нет database_connection / database_encryption.; этап db_config
+
+  - id: wiki-db-encryption-mode
+    title: 'Указан неверный параметр «mode» конфигурации шифрования БД. (DB-ENCRYPTION-MODE)'
+    patterns:
+      - 'Указан\ неверный\ параметр\ «mode»\ конфигурации\ шифрования\ БД'
+      - 'Неверная\ конфигурация\ шифрования\ БД'
+    severity: crit
+    cause: >-
+      Опечатка в mode.
+    fix: >-
+      Задать корректный mode.
+    # источник в инсталлере: script/validate_db_configuration.py:369-374 Условие: mode не из none/read_write/read.; этап db_config
+
+  - id: wiki-db-encryption-no-master
+    title: 'Мастер ключ конфигурации шифрования БД должен быть указан при включ... (DB-ENCRYPTION-NO-MASTER)'
+    patterns:
+      - 'Мастер\ ключ\ конфигурации\ шифрования\ БД\ должен\ быть\ указан\ при\ включенном\ шифровании\ БД'
+    severity: crit
+    cause: >-
+      Включено шифрование без мастер-ключа.
+    fix: >-
+      Указать master_key в database.yaml.
+    # источник в инсталлере: script/validate_db_configuration.py:382-384 Условие: mode != none, но master_key пуст.; этап db_config
+
+  - id: wiki-db-encryption-disable
+    title: 'Необходимо включить шифрование БД — ранее использовалась конфигурац... (DB-ENCRYPTION-DISABLE)'
+    patterns:
+      - 'Необходимо\ включить\ шифрование\ БД\ —\ ранее\ использовалась\ конфигурация\ с\ шифрованием'
+    severity: crit
+    cause: >-
+      Попытка выключить уже работающее шифрование.
+    fix: >-
+      Оставить шифрование включённым (mode read/read_write).
+    # источник в инсталлере: script/validate_db_configuration.py:407-408 Условие: В lock-файле шифрование было включено, в новом выключено.; этап db_config
+
+  - id: wiki-apply-db-not-host
+    title: 'Скрипт можно выполнить только для host драйвера (APPLY-DB-NOT-HOST)'
+    patterns:
+      - 'Скрипт\ можно\ выполнить\ только\ для\ host\ драйвера'
+    severity: crit
+    cause: >-
+      Запуск apply_db_configuration при docker-драйвере.
+    fix: >-
+      apply_db_configuration только для host-драйвера; для docker применять иначе.
+    # источник в инсталлере: script/apply_db_configuration.py:77-78 Условие: database_connection.driver != host.; этап db_config
+
+  - id: wiki-migrate-failed
+    title: 'Что то пошло не так. Не смогли накатить миграции (MIGRATE-FAILED)'
+    patterns:
+      - 'Что\ то\ пошло\ не\ так\.\ Не\ смогли\ накатить\ миграции'
+    severity: crit
+    cause: >-
+      Ошибка миграций БД (схема/доступ/данные).
+    fix: >-
+      Изучить вывод migrate_up.php; проверить доступность БД, права, целостность.
+    # источник в инсталлере: script/companies_database_migrations_up.py:181-183 Условие: migrate_up.php все попытки (180с) код != 0.; этап migrations
+
+  - id: wiki-installer-migrate-failed
+    title: 'Ошибка при выполнении миграции инсталлятора (INSTALLER-MIGRATE-FAILED)'
+    patterns:
+      - 'Ошибка\ при\ выполнении\ миграции\ инсталлятора'
+      - '\(exit\ 1\ без\ текста\ для\ migration_scripts\)'
+    severity: crit
+    cause: >-
+      Ошибка в скрипте миграции конкретной версии (updates/<version>/).
+    fix: >-
+      Смотреть stdout/stderr скрипта; устранить причину; версия не запишется в .version, миграции повторятся. Exit code: 1
+    # источник в инсталлере: script/update.py:218; installer_migrations_up.py:104-105 Условие: installer_migrations_up.py / скрипт миграции версии вернул != 0.; этап migrations
+
+  - id: wiki-activate-failed
+    title: 'Что то пошло не так. Не смогли активировать сервер (ACTIVATE-FAILED) [частая]'
+    patterns:
+      - 'Что\ то\ пошло\ не\ так\.\ Не\ смогли\ активировать\ сервер'
+    severity: crit
+    cause: >-
+      Нет связи с сервером лицензий (45.92.177.63:443), неверная/просроченная лицензия, неверная YC-подпись/metadata, БД pivot недоступна.
+    fix: >-
+      Изучить вывод activate.php; проверить сетевой доступ к серверу активации/лицензий; для Yandex Cloud — доступность metadata; проверить лицензию и БД.
+    # источник в инсталлере: script/activate_server.py:135 Условие: activate.php вернул != 0.; этап activate
+
+  - id: wiki-update-stack-remove
+    title: 'Не смогли удалить все контейнеры при смене service_label (UPDATE-STACK-REMOVE)'
+    patterns:
+      - 'Не\ смогли\ удалить\ все\ контейнеры\ при\ смене\ service_label'
+      - 'Не\ смогли\ удалить\ сети\ при\ смене\ service_label'
+    severity: crit
+    cause: >-
+      Зависшие контейнеры/сети, занятые ресурсы.
+    fix: >-
+      Проверить docker stack rm/ps, удалить вручную зависшие контейнеры/сети.
+    # источник в инсталлере: script/update.py:566,579 Условие: Контейнеры/сети не удалились за timeout 600/120с.; этап update
+
+  - id: wiki-update-go-db-not-up
+    title: 'go_database не поднялся (UPDATE-GO-DB-NOT-UP)'
+    patterns:
+      - 'go_database\ не\ поднялся'
+      - 'не\ смогли\ найти\ php_monolith\ контейнер'
+    severity: crit
+    cause: >-
+      Сервис go-database-controller / php_monolith не поднялся при обновлении.
+    fix: >-
+      Логи сервисов; проверить registry, ресурсы, БД.
+    # источник в инсталлере: script/update.py:111,119,133,149,190 Условие: Сервис не достиг completed/healthy за timeout.; этап update
+
+  - id: wiki-update-space-configs
+    title: 'Не смогли обновить конфигурацию пространств. Убедитесь, что окружен... (UPDATE-SPACE-CONFIGS)'
+    patterns:
+      - 'Не\ смогли\ обновить\ конфигурацию\ пространств\.\ Убедитесь,\ что\ окружение\ поднялось\ корректно'
+    severity: crit
+    cause: >-
+      Ошибка обновления конфигурации пространств при апгрейде со старой версии.
+    fix: >-
+      Смотреть вывод php; проверить healthy окружение и БД.
+    # источник в инсталлере: script/update.py:821-822 Условие: force_update_company_db.php вернул != 0 (версии < 4.1.0).; этап update
+
+  - id: wiki-update-busy-companies
+    title: 'Ошибка при проверке занятых компаний (UPDATE-BUSY-COMPANIES)'
+    patterns:
+      - 'Ошибка\ при\ проверке\ занятых\ компаний'
+    severity: crit
+    cause: >-
+      Ошибка проверки активных компаний перед операцией.
+    fix: >-
+      Смотреть вывод check_is_busy_companies.py.
+    # источник в инсталлере: script/update.py:871 Условие: check_is_busy_companies.py вернул != 0.; этап update
+
+  - id: wiki-update-custom-files
+    title: 'Ошибка при подготовке файлов к загрузке (UPDATE-CUSTOM-FILES)'
+    patterns:
+      - 'Ошибка\ при\ подготовке\ файлов\ к\ загрузке'
+    severity: crit
+    cause: >-
+      Проблема с custom_files (имена/доступ к каталогу).
+    fix: >-
+      Проверить <root_mount_path>/custom_files и права.
+    # источник в инсталлере: script/update.py:466 (prepare_custom_files.py) Условие: prepare_custom_files.py вернул != 0.; этап update
+
+  - id: wiki-backup-remote-access
+    title: 'У пользователя нет доступа к удаленой директории <path> (BACKUP-REMOTE-ACCESS)'
+    patterns:
+      - 'У\ пользователя\ нет\ доступа\ к\ удаленой\ директории\ <path>'
+      - 'Не\ удалось\ создать\ локальную\ директорию\ <path>'
+      - 'Нет\ прав\ на\ запись\ в\ локальную\ директорию\ <path>'
+    severity: crit
+    cause: >-
+      Недостаточно прав/доступа к каталогу бэкапов.
+    fix: >-
+      Дать права на каталог; проверить доступ.
+    # источник в инсталлере: script/utils/scriptutils.py:448-462 Условие: Нет прав/доступа к директории назначения (бэкапы).; этап update
+
+  - id: wiki-uninstall-cancelled
+    title: 'Удаление приложения было отменено (UNINSTALL-CANCELLED)'
+    patterns:
+      - 'Удаление\ приложения\ было\ отменено'
+      - 'Удаление\ данных\ было\ отменено'
+    severity: crit
+    cause: >-
+      Намеренная отмена.
+    fix: >-
+      Подтвердить при необходимости.
+    # источник в инсталлере: script/uninstall.py:114,306 Условие: Пользователь не подтвердил удаление.; этап uninstall
+
+  - id: wiki-uninstall-not-removed
+    title: 'Приложение не было удалено (UNINSTALL-NOT-REMOVED)'
+    patterns:
+      - 'Приложение\ не\ было\ удалено'
+    severity: crit
+    cause: >-
+      Зависшие контейнеры/сети.
+    fix: >-
+      Удалить вручную: docker stack rm, docker network rm.
+    # источник в инсталлере: script/uninstall.py:248,261 Условие: Контейнеры/сети не удалились за timeout 600/120с.; этап uninstall
+
+  - id: wiki-uninstall-no-mount
+    title: 'В конфигурации global.yaml не указан путь до данных приложения, пол... (UNINSTALL-NO-MOUNT)'
+    patterns:
+      - 'В\ конфигурации\ global\.yaml\ не\ указан\ путь\ до\ данных\ приложения,\ поле\ root_mount_path'
+      - 'Путь,\ указанный\ в\ \.\.\.\ root_mount_path,\ не\ существует'
+    severity: crit
+    cause: >-
+      Не задан/неверный root_mount_path.
+    fix: >-
+      Указать корректный root_mount_path в global.yaml.
+    # источник в инсталлере: script/uninstall.py:290-300 Условие: Нет root_mount_path / путь не существует.; этап uninstall
+
+  - id: wiki-install-repl-db-driver
+    title: 'Отказоустойчивость можно настроить только для docker драйвера баз д... (INSTALL-REPL-DB-DRIVER)'
+    patterns:
+      - 'Отказоустойчивость\ можно\ настроить\ только\ для\ docker\ драйвера\ баз\ данных'
+    severity: crit
+    cause: >-
+      Несовместимость репликации с host-драйвером БД.
+    fix: >-
+      Использовать docker-драйвер БД или отключить service_label.
+    # источник в инсталлере: script/install.py:287; update.py:311 (replication/validate_db_docker.py) Условие: Репликация (service_label) включена, но драйвер БД = host/predefined.; этап replication
+
+  - id: wiki-install-repl-os
+    title: 'В данной версии приложения отказоустойчивость нельзя включить в RPM... (INSTALL-REPL-OS)'
+    patterns:
+      - 'В\ данной\ версии\ приложения\ отказоустойчивость\ нельзя\ включить\ в\ RPM\-системах'
+    severity: crit
+    cause: >-
+      Репликация на RPM не поддерживается.
+    fix: >-
+      Отключить репликацию или использовать deb-ОС.
+    # источник в инсталлере: script/install.py:291; update.py:317 (replication/validate_os.py) Условие: RPM-ОС + включена репликация.; этап replication
+
+  - id: wiki-repl-yandex-cloud
+    title: 'В окружении Yandex Cloud запуск репликации недоступен. (REPL-YANDEX-CLOUD)'
+    patterns:
+      - 'В\ окружении\ Yandex\ Cloud\ запуск\ репликации\ недоступен'
+    severity: crit
+    cause: >-
+      Репликация недоступна на YC Marketplace.
+    fix: >-
+      Отключить service_label на YC Marketplace.
+    # источник в инсталлере: script/utils/scriptutils.py:302-304 (assert_replication_available); init.py:1937 Условие: Продукт из Yandex Cloud Marketplace + включена репликация.; этап replication
+
+  - id: wiki-repl-service-label
+    title: 'Не заполнен параметр service_label (REPL-SERVICE-LABEL)'
+    patterns:
+      - 'Не\ заполнен\ параметр\ service_label'
+      - 'Параметр\ service_label\ не\ должен\ быть\ длинее\ 12\ символов'
+    severity: crit
+    cause: >-
+      Неверный service_label.
+    fix: >-
+      Задать service_label длиной не более 8 символов.
+    # источник в инсталлере: script/init.py:1934,1940 Условие: service_label = None / длина > 8 (текст ошибки говорит 12, фактическая проверка len > 8).; этап replication
+
+  - id: wiki-repl-mysql-server-id
+    title: 'Параметр mysql_server_id ... должен быть числом (REPL-MYSQL-SERVER-ID)'
+    patterns:
+      - 'Параметр\ mysql_server_id\ \.\.\.\ должен\ быть\ числом'
+      - 'не\ должен\ быть\ меньше\ 0'
+    severity: crit
+    cause: >-
+      Неверный mysql_server_id в replication.yaml.
+    fix: >-
+      Задать mysql_server_id > 0.
+    # источник в инсталлере: script/init.py:1946,1948,1951,1954 Условие: mysql_server_id не число / None / < 0 / == 0 при заданном service_label.; этап replication
+
+  - id: wiki-repl-start-octet
+    title: 'Параметр start_octet ... должен быть числом (REPL-START-OCTET)'
+    patterns:
+      - 'Параметр\ start_octet\ \.\.\.\ должен\ быть\ числом'
+      - 'не\ должен\ быть\ равен\ 17\ или\ 18'
+    severity: crit
+    cause: >-
+      Неверный start_octet в replication.yaml.
+    fix: >-
+      Задать start_octet >= 1 и не равный 17/18.
+    # источник в инсталлере: script/init.py:1960,1962,1965,1968 Условие: start_octet не число / None / 17|18 / < 1.; этап replication
+
+  - id: wiki-trigger-check-security
+    title: 'Приватный ключ невалидный! (TRIGGER-CHECK-SECURITY) [частая]'
+    patterns:
+      - 'Приватный\ ключ\ невалидный!'
+      - 'Сертификат\ невалидный!'
+      - 'Сертификат\ не\ относится\ к\ хосту\ проекта'
+    severity: crit
+    cause: >-
+      Отсутствуют/битые/просроченные nginx-серты в <root_mount_path>/nginx/ssl/; CN серта != host; ключ не от серта.
+    fix: >-
+      Перегенерировать nginx-серты (generate_ssl_certificates.py --force), проверить CN=host, срок действия, соответствие ключа и серта. Примечание: «У проекта или подпроекта отсутствует nginx» -> exit 0 (не ошибка).
+    # источник в инсталлере: triggers/check_security.py:26-114 Условие: Проверка SSL/nginx проекта не пройдена (запускается из deploy как trigger).; этап triggers
+
+  - id: wiki-trigger-cert-config
+    title: 'Сертификат <project> невалидный! (отсутствие серта -> предупреждени... (TRIGGER-CERT-CONFIG)'
+    patterns:
+      - 'Сертификат\ <project>\ невалидный!\ \(отсутствие\ серта\ \->\ предупреждение\ \+\ continue\)'
+    severity: crit
+    cause: >-
+      Повреждённый/не-PEM сертификат проекта.
+    fix: >-
+      Перегенерировать nginx-серт проекта.
+    # источник в инсталлере: triggers/generate_certificate_config.py:45-47 Условие: Серт не парсится OpenSSL.; этап triggers
+
+  - id: wiki-root-required
+    title: 'Скрипт необходимо запускать от рута (ROOT-REQUIRED) [частая]'
+    patterns:
+      - 'Скрипт\ необходимо\ запускать\ от\ рута'
+    severity: crit
+    cause: >-
+      Скрипт запущен не от root.
+    fix: >-
+      Запускать через sudo / от root. Exit code: 71
+    # источник в инсталлере: script/utils/scriptutils.py:39-41 (assert_root) Условие: os.geteuid() != 0 — в install.py, init.py, update.py, uninstall.py, init_pivot.py, init_premise.py, generate_, create_.; этап all
+
+  - id: wiki-security-file-missing
+    title: 'Не найден файл с ключами для деплоя. Окружение было ранее развернуто? (SECURITY-FILE-MISSING)'
+    patterns:
+      - 'Не\ найден\ файл\ с\ ключами\ для\ деплоя\.\ Окружение\ было\ ранее\ развернуто\?'
+      - 'Файл\ со\ значениями\ невалиден\.\ Окружение\ было\ ранее\ развернуто\?'
+    severity: crit
+    cause: >-
+      Окружение не развёрнуто / повреждён security.yaml.
+    fix: >-
+      Запустить generate_security_keys.py / проверить security.yaml.
+    # источник в инсталлере: script/utils/scriptutils.py:244,251 Условие: Нет root_mount_path/security.yaml либо нет блока replication.mysql_user.; этап all
+
+  - id: wiki-mysql-container-find
+    title: 'Не найден ни один контейнер (mysql + monolith). (MYSQL-CONTAINER-FIND)'
+    patterns:
+      - 'Не\ найден\ ни\ один\ контейнер\ \(mysql\ \+\ monolith\)'
+      - 'Найдено\ несколько\ контейнеров\ \(mysql\ \+\ monolith\)\.\ Ожидался\ единственный'
+      - 'Не\ найден\ ни\ один\ контейнер\ \(mysql\ \+\ <domino_id>\-company\)'
+    severity: crit
+    cause: >-
+      Стек не поднялся / неверный тип.
+    fix: >-
+      docker service ls/ps; дождаться healthy mysql; проверить тип.
+    # источник в инсталлере: script/utils/scriptutils.py:234 Условие: Контейнер mysql не найден за timeout 600с / неверный тип.; этап all
