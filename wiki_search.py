@@ -4,11 +4,9 @@ import sys
 
 sys.dont_write_bytecode = True
 
-# Поиск по локальному дампу базы знаний Compass (создаётся wiki_fetch.py).
+# Поиск по локальному дампу базы знаний Compass (~/compass-wiki, обновляется wiki_fetch.py).
 # Ищет слова/фразы/regex по всем страницам, показывает совпадения со сниппетами,
-# заголовком и исходным url страницы. Без зависимостей: python 3.8+.
-#
-# Дамп по умолчанию ~/compass-wiki (index.json рядом).
+# заголовком и исходным url страницы. Без зависимостей.
 
 import re
 import json

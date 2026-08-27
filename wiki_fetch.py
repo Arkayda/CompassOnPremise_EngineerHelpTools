@@ -22,6 +22,7 @@ from datetime import datetime
 
 DEFAULT_SITEMAP = "https://wiki.service.sel.apitest.team/sitemap.xml"
 DEFAULT_HOST = "wiki.service.sel.apitest.team"
+# дамп хранится вне репозитория — это справочная база, не код
 DEFAULT_OUT = str(Path.home() / "compass-wiki")
 
 parser = argparse.ArgumentParser(
