@@ -36,7 +36,7 @@ python3 diagnose.py --since 24h --http-timeout 5              # глубже п�
 
 Группы проверок (запускаются все сразу, `--only` сужает список): `config`, `infra`,
 `requirements` (CPU/RAM/диск/порты против минимумов из документации), `services`, `http`,
-`external` (license/push/registry/billing/SMTP), `functional` (смоук-тесты: очередь
+`external` (license/push/registry/billing/SMTP, DNS с хоста и из контейнера), `functional` (смоук-тесты: очередь
 автоудаления файлов, крон, manticore), `db`, `kafka`, `logs` (включая сверку с базой
 известных проблем `errors_kb.yaml` — с рецептом лечения в отчёте), `backups`.
 

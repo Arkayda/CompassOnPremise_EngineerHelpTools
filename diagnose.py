@@ -1324,6 +1324,120 @@ def check_external_smtp(ctx):
                        smtp_host, smtp_port, error_summary(str(e))))
 
 
+# ---ПРОВЕРКИ: DNS (хост и контейнеры)---#
+
+# имена, которые обязан резолвить хост: лицензия + собственный домен из values
+def dns_probe_names(ctx):
+    names = ["license.getcompass.ru"]
+    host_value = ctx.value("host")
+    if host_value and host_value != "example.com":
+        names.append(host_value)
+    return names
+
+
+@check("external", "DNS с хоста")
+def check_external_dns_host(ctx):
+    # детект systemd-resolved stub: если все nameserver-ы локальные (127.*),
+    # docker не сможет отдать их контейнерам и молча подставит публичный DNS
+    stub_only = False
+    try:
+        resolv_text = Path("/etc/resolv.conf").read_text(encoding="utf-8")
+        nameservers = [line.split()[1] for line in resolv_text.splitlines()
+                       if line.strip().startswith("nameserver")]
+        stub_only = bool(nameservers) and all(ns.startswith("127.") for ns in nameservers)
+    except OSError:
+        pass
+
+    resolved, failed = [], []
+    for name in dns_probe_names(ctx):
+        try:
+            addr_infos = socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)
+            ips = sorted({info[4][0] for info in addr_infos})
+            resolved.append("%s -> %s" % (name, ", ".join(ips[:2])))
+        except socket.gaierror as e:
+            failed.append("%s (%s)" % (name, error_summary(str(e))))
+
+    if failed:
+        ctx.record("external", "DNS с хоста", STATUS_FAIL,
+                   "не резолвятся: %s — проверьте DNS-серверы в /etc/resolv.conf" % ", ".join(failed))
+        return
+
+    if stub_only:
+        ctx.record("external", "DNS с хоста", STATUS_WARN,
+                   "%s; но в /etc/resolv.conf только stub-резолвер (127.0.0.53): контейнерам docker "
+                   "подставит публичный DNS — убедитесь, что исходящий UDP 53 открыт, или пропишите "
+                   "рабочие dns в /etc/docker/daemon.json" % "; ".join(resolved))
+        return
+
+    ctx.record("external", "DNS с хоста", STATUS_OK, "; ".join(resolved))
+
+
+@check("external", "DNS из контейнера")
+def check_external_dns_container(ctx):
+    # берём живой контейнер приложения (php-monolith или любой php/go на этой ноде)
+    probe_container = None
+    for stack in ctx.stacks():
+        for name_substring in ("php-monolith", "php-file-node", "go-sender"):
+            found = find_containers(ctx, stack, name_substring)
+            if found:
+                probe_container = found[0]
+                break
+        if probe_container is not None:
+            break
+
+    if probe_container is None:
+        ctx.record("external", "DNS из контейнера", STATUS_SKIP,
+                   "нет подходящего контейнера на этой ноде")
+        return
+
+    monolith_label = ctx.value("projects.monolith.label", "monolith")
+    external_name = "license.getcompass.ru"
+    internal_name = "mysql-%s" % monolith_label
+
+    def resolve_in_container(name):
+        rc, out = exec_in_container(probe_container, "getent hosts %s" % name)
+        if rc != 0 and "not found" in out.lower():
+            return None, out  # в образе нет getent
+        resolved = rc == 0 and bool(out.strip())
+        return resolved, (out.splitlines()[0].strip() if out.strip() else "")
+
+    getent_missing = None
+    external_ok, external_out = resolve_in_container(external_name)
+    if external_ok is None:
+        getent_missing = external_out
+        ctx.record("external", "DNS из контейнера", STATUS_SKIP,
+                   "в образе %s нет getent — проверка пропущена" % probe_container.name.split(".")[0][:40])
+        return
+
+    internal_ok, internal_out = resolve_in_container(internal_name)
+
+    container_short = probe_container.name.split(".")[0][:50]
+    if external_ok and internal_ok:
+        external_ip = external_out.split()[0] if external_out.split() else external_name
+        ctx.record("external", "DNS из контейнера", STATUS_OK,
+                   "из %s: %s -> %s; внутренние имена тоже ок (%s)" % (
+                       container_short, external_name, external_ip, internal_name))
+        return
+
+    if internal_ok and not external_ok:
+        ctx.record("external", "DNS из контейнера", STATUS_FAIL,
+                   "из %s внешние имена не резолвятся (%s), внутренние ок — внешний DNS контейнеров недоступен. "
+                   "Смотреть: journalctl -u docker | grep 'failed to query external DNS'; лечение: рабочие dns "
+                   "в /etc/docker/daemon.json + systemctl restart docker (в окно обслуживания), "
+                   "если исходящий 53 закрыт — DNS клиента вместо публичных" % (container_short, external_name))
+        return
+
+    if not internal_ok and not external_ok:
+        ctx.record("external", "DNS из контейнера", STATUS_FAIL,
+                   "из %s не резолвится ничего (даже внутреннее %s) — проблема сети контейнера/overlay, "
+                   "не только DNS" % (container_short, internal_name))
+        return
+
+    ctx.record("external", "DNS из контейнера", STATUS_WARN,
+               "из %s внешние ок, но внутреннее %s не резолвится — проверьте, что сервисы в одной сети" % (
+                   container_short, internal_name))
+
+
 # ---ПРОВЕРКИ: ФУНКЦИОНАЛЬНЫЕ СМОУК-ТЕСТЫ---#
 
 @check("functional", "автоудаление файлов: очередь")
