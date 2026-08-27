@@ -32,13 +32,13 @@ python3 diagnose.py -e production -v compass                  # полный о�
 python3 diagnose.py --only services,db,logs                   # только выбранные группы
 python3 diagnose.py --json > /tmp/diagnose.json               # машиночитаемый отчёт
 python3 diagnose.py --since 24h --http-timeout 5              # глубже по логам, быстрее по http
-python3 diagnose.py --functional --only functional            # функциональные смоук-тесты
 ```
 
-Группы проверок: `config`, `infra`, `requirements` (CPU/RAM/диск/порты против минимумов
-из документации), `services`, `http`, `external` (license/push/registry/billing/SMTP),
-`functional` (только с `--functional`: очередь автоудаления файлов, крон, manticore),
-`db`, `kafka`, `logs`, `backups`.
+Группы проверок (запускаются все сразу, `--only` сужает список): `config`, `infra`,
+`requirements` (CPU/RAM/диск/порты против минимумов из документации), `services`, `http`,
+`external` (license/push/registry/billing/SMTP), `functional` (смоук-тесты: очередь
+автоудаления файлов, крон, manticore), `db`, `kafka`, `logs` (включая сверку с базой
+известных проблем `errors_kb.yaml` — с рецептом лечения в отчёте), `backups`.
 
 Код завершения: `0` — критических проблем нет, `1` — есть FAIL (удобно для cron/алертов).
 Пароли mysql подбираются автоматически: env контейнера → Docker Secrets → values

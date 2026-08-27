@@ -28,7 +28,7 @@ import requests
 from common import (
     assert_root, blue, cyan, error, success, warning, die, get_hostname,
     create_parser, find_installer_dir, run_cmd, exec_in_container,
-    mysql_query_raw, get_value,
+    mysql_query_raw, get_value, load_errors_kb, match_error_kb,
     probe_mysql_credentials as probe_mysql_credentials_common,
     load_values as load_values_common,
 )
@@ -109,15 +109,14 @@ RUN_ONCE_SERVICE_PREFIXES = ("default-file",)
 
 parser = create_parser(
     description="Диагностика установленного окружения Compass On-premise: конфигурация, сервисы, базы, HTTP, логи, бэкапы.",
-    usage="python3 diagnose.py [-e ENVIRONMENT] [-v VALUES] [--installer-dir PATH] [--only GROUPS] [--since PERIOD] [--functional] [--json] [--no-color]",
+    usage="python3 diagnose.py [-e ENVIRONMENT] [-v VALUES] [--installer-dir PATH] [--only GROUPS] [--since PERIOD] [--json] [--no-color]",
     epilog="Примеры:\n"
            "  python3 diagnose.py -e production -v compass\n"
            "  python3 diagnose.py -e production --only services,db,logs --since 24h\n"
-           "  python3 diagnose.py --functional --only functional\n"
            "  python3 diagnose.py --json > /tmp/diagnose.json\n"
            "\n"
            "Группы проверок: " + ", ".join([group[0] for group in GROUPS]) + ".\n"
-           "Группа functional запускается только с флагом --functional.\n"
+           "Запускаются все группы сразу; --only сужает список.\n"
            "Код завершения: 0 — критических проблем нет, 1 — есть FAIL.",
 )
 parser.add_argument('-e', '--environment', required=False, default="production", type=str,
@@ -134,8 +133,6 @@ parser.add_argument("--http-timeout", required=False, default=DEFAULT_HTTP_TIMEO
                     help="Таймаут HTTP-проверок в секундах")
 parser.add_argument("--log-tail", required=False, default=LOG_TAIL_LIMIT, type=int,
                     help="Сколько строк лога сервиса просматривать")
-parser.add_argument("--functional", required=False, action="store_true",
-                    help="Запустить функциональные смоук-тесты (группа functional: автоудаление файлов, крон, поиск)")
 parser.add_argument("--json", required=False, action="store_true",
                     help="Вывести отчёт в формате JSON (для мониторинга)")
 parser.add_argument("--no-color", required=False, action="store_true",
@@ -1327,7 +1324,7 @@ def check_external_smtp(ctx):
                        smtp_host, smtp_port, error_summary(str(e))))
 
 
-# ---ПРОВЕРКИ: ФУНКЦИОНАЛЬНЫЕ СМОУК-ТЕСТЫ (запускаются только с --functional)---#
+# ---ПРОВЕРКИ: ФУНКЦИОНАЛЬНЫЕ СМОУК-ТЕСТЫ---#
 
 @check("functional", "автоудаление файлов: очередь")
 def check_functional_file_queue(ctx):
@@ -1659,6 +1656,7 @@ def check_kafka_topics(ctx):
 @check("logs", "ошибки в логах сервисов")
 def check_logs(ctx):
     noisy = []
+    kb_entries = load_errors_kb()
 
     for stack in ctx.stacks():
         for service in ctx.stack_services(stack):
@@ -1678,18 +1676,55 @@ def check_logs(ctx):
                 if count > 0:
                     found.append("%s×%d" % (pattern_name, count))
 
-            if found:
-                noisy.append((short_name, found))
+            # сверка с базой известных проблем; одинаковые строки (цифры -> N)
+            # схлопываем и матчим по одному представителю — повторы лишь увеличивают счётчик
+            kb_hits = {}
+            if kb_entries:
+                first_raw = {}
+                counts = {}
+                for line in out.splitlines():
+                    key = re.sub(r"\d+", "N", line)
+                    counts[key] = counts.get(key, 0) + 1
+                    if key not in first_raw:
+                        first_raw[key] = line
+
+                for key, raw_line in first_raw.items():
+                    entry = match_error_kb(kb_entries, raw_line)
+                    if entry is not None:
+                        prev = kb_hits.get(entry["id"], (entry, 0))
+                        kb_hits[entry["id"]] = (entry, prev[1] + counts[key])
+
+            if found or kb_hits:
+                noisy.append((short_name, found, kb_hits))
 
     if not noisy:
         ctx.record("logs", "ошибки в логах сервисов", STATUS_OK,
-                   "за %s критичных паттернов не найдено" % args.since)
+                   "за %s критичных паттернов и известных проблем не найдено" % args.since)
         return
 
-    for short_name, found in noisy:
+    for short_name, found, kb_hits in noisy:
         total = sum(int(re.search(r"×(\d+)$", item).group(1)) for item in found if re.search(r"×(\d+)$", item))
-        status = STATUS_FAIL if total >= LOG_FAIL_COUNT else STATUS_WARN
-        ctx.record("logs", short_name, status, ", ".join(found))
+
+        # известные проблемы: crit из базы — сразу FAIL, с рецептом в сообщении
+        known_parts = []
+        has_known_crit = False
+        for entry, count in sorted(kb_hits.values(), key=lambda item: -item[1]):
+            known_parts.append("%s ×%d" % (entry["title"], count))
+            if entry["severity"] == "crit":
+                has_known_crit = True
+        if known_parts:
+            top_entry = sorted(kb_hits.values(), key=lambda item: -item[1])[0][0]
+            recipe = " — %s" % top_entry["fix"][:200] if top_entry["fix"] else ""
+
+        if total >= LOG_FAIL_COUNT or has_known_crit:
+            status = STATUS_FAIL
+        else:
+            status = STATUS_WARN
+
+        message_parts = list(found)
+        if known_parts:
+            message_parts.append("известная проблема: %s%s" % ("; ".join(known_parts[:2]), recipe))
+        ctx.record("logs", short_name, status, ", ".join(message_parts))
 
 
 # ---ПРОВЕРКИ: БЭКАПЫ---#
@@ -1829,9 +1864,6 @@ def main():
             ", ".join(unknown_groups), ", ".join(known_groups)))
 
     for check_item in CHECKS:
-        # функциональные смоук-тесты — только по явному флагу
-        if check_item["group"] == "functional" and not args.functional:
-            continue
         if only_groups and check_item["group"] not in only_groups:
             continue
         run_check_safely(check_item, ctx)
