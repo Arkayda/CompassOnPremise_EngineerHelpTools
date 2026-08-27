@@ -284,3 +284,49 @@ def probe_mysql_credentials(container, values_dict, extra_passwords=None):
                 return user, password
 
     return None
+
+
+# --- база знаний известных ошибок (errors_kb.yaml рядом со скриптами) ---#
+
+# загрузить базу знаний; при отсутствии файла или pyyaml возвращает пустой список
+def load_errors_kb():
+    try:
+        import re as re_module
+        import yaml as yaml_module
+
+        kb_path = Path(__file__).resolve().parent / "errors_kb.yaml"
+        if not kb_path.exists():
+            return []
+
+        data = yaml_module.safe_load(kb_path.read_text(encoding="utf-8")) or {}
+        entries = []
+        for raw in (data.get("entries") or []):
+            patterns = []
+            for pattern in (raw.get("patterns") or []):
+                try:
+                    patterns.append(re_module.compile(pattern))
+                except re_module.error:
+                    continue
+            if not patterns:
+                continue
+            entries.append({
+                "id": raw.get("id", ""),
+                "title": raw.get("title", ""),
+                "cause": raw.get("cause", ""),
+                "fix": raw.get("fix", ""),
+                "severity": raw.get("severity", "warn"),
+                "doc": raw.get("doc", ""),
+                "patterns": patterns,
+            })
+        return entries
+    except Exception:
+        return []
+
+
+# найти первую подходящую запись базы знаний для строки лога (или None)
+def match_error_kb(kb_entries, line):
+    for entry in kb_entries:
+        for pattern in entry["patterns"]:
+            if pattern.search(line):
+                return entry
+    return None
