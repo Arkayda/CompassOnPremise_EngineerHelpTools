@@ -81,6 +81,9 @@ BACKUP_FAIL_HOURS = 24 * 7
 # через сколько секунд таймаут для HTTP-запросов
 DEFAULT_HTTP_TIMEOUT = 15
 
+# быстрая tcp-проба доступности host из values (не ждём полный http-таймаут на каждом пути)
+HOST_PROBE_TIMEOUT = 5
+
 # сколько строк лога сервиса просматриваем за период
 LOG_TAIL_LIMIT = 2000
 
@@ -280,6 +283,8 @@ class DiagnoseContext:
         self._stack_containers = {}
         # кэш: подобранные креды mysql {container_id: (user, password)}
         self._mysql_creds = {}
+        # кэш: доступен ли host из values по сети (None — ещё не проверяли)
+        self._host_reachable = None
 
     # записать результат проверки
     def record(self, group, name, status, message=""):
@@ -343,6 +348,23 @@ class DiagnoseContext:
                 return default
             node = node[part]
         return node
+
+    # доступен ли host из values снаружи (быстрая tcp-проба, один раз за прогон):
+    # недоступный host не должен сжигать http-таймауты на каждой проверке
+    def is_values_host_reachable(self):
+        if self._host_reachable is None:
+            host = self.value("host")
+            port = main_external_port(self) if host else None
+            if not host or not port:
+                self._host_reachable = False
+            else:
+                try:
+                    probe = socket.create_connection((host, port), timeout=HOST_PROBE_TIMEOUT)
+                    probe.close()
+                    self._host_reachable = True
+                except Exception:
+                    self._host_reachable = False
+        return self._host_reachable
 
 
 # ---РАЗРЕШЕНИЕ КРЕДОВ MYSQL---#
@@ -1096,16 +1118,20 @@ def check_go_sender_ws(ctx):
         if label:
             candidate_paths.append("/%s/ws" % label)
 
-    # проход 1: по host из values
-    network_unreachable = True
-    for path in candidate_paths:
-        code, first_line = ws_upgrade_probe(host, ws_port, path)
-        if code == 101:
-            ctx.record("services", "websocket go_sender (realtime)", STATUS_OK,
-                       "upgrade ок: %s:%d%s" % (host, ws_port, path))
-            return
-        if code is not None:
-            network_unreachable = False  # host отвечает — просто путь не подошёл
+    # проход 1: по host из values (если он вообще доступен по сети — иначе сразу локальный проход)
+    network_unreachable = not ctx.is_values_host_reachable()
+    if not network_unreachable:
+        for path in candidate_paths:
+            code, first_line = ws_upgrade_probe(host, ws_port, path)
+            if code == 101:
+                ctx.record("services", "websocket go_sender (realtime)", STATUS_OK,
+                           "upgrade ок: %s:%d%s" % (host, ws_port, path))
+                return
+            if code is not None:
+                network_unreachable = False  # host отвечает — просто путь не подошёл
+            else:
+                network_unreachable = True
+                break
 
     # проход 2: host из values недоступен — все пути локально, с SNI=host
     if network_unreachable:
@@ -1267,6 +1293,20 @@ def main_external_port(ctx):
 # проверить http-доступность url; local_port — порт, опубликованный на хосте,
 # по которому можно стучаться в обход values host (для диагностики "host не резолвится, но сервис жив")
 def http_check(ctx, group, name, url, local_port=None):
+    # host из values недоступен по сети (быстрая проба уже сделана) — не сжигаем http-таймаут,
+    # сразу проверяем локальный опубликованный порт
+    if local_port and not ctx.is_values_host_reachable():
+        local_result = http_probe_local(url, local_port)
+        if local_result is not None:
+            ctx.record(group, name, STATUS_WARN,
+                       "%s — host из values недоступен по сети, но локально на 127.0.0.1:%d отвечает кодом %d; "
+                       "проверьте доступность host" % (url, local_port, local_result))
+            return None
+        ctx.record(group, name, STATUS_FAIL,
+                   "%s — недоступен: host из values не отвечает по сети, локально на 127.0.0.1:%d тоже" % (
+                       url, local_port))
+        return None
+
     try:
         response = requests.get(
             url,
@@ -1404,8 +1444,8 @@ def check_certificates(ctx):
         days_left = certificate_days_left_file(cert_path)
         record_cert_result(ctx, "сертификат %s" % cert_path.name, days_left)
 
-    # сертификат, который реально отдаёт главный nginx
-    if ctx.values_loaded and ctx.value("host"):
+    # сертификат, который реально отдаёт главный nginx (только если host доступен по сети)
+    if ctx.values_loaded and ctx.value("host") and ctx.is_values_host_reachable():
         port = int(ctx.value("projects.monolith.service.nginx.external_https_port") or 443)
         days_left = certificate_days_left_remote(ctx.value("host"), port)
         if days_left is not None:
