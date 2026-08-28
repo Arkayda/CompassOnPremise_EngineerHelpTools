@@ -16,9 +16,12 @@ sys.dont_write_bytecode = True
 import os
 import re
 import ssl
+import sys
 import json
+import time
 import base64
 import socket
+import shutil
 import shlex
 import traceback
 import email.utils
@@ -751,6 +754,7 @@ def service_restart_condition(service_name):
 @check("services", "реплики сервисов")
 def check_service_replicas(ctx):
     for stack in ctx.stacks():
+        progress("реплики сервисов: стек %s" % stack)
         try:
             services = ctx.stack_services(stack)
         except Exception as e:
@@ -798,6 +802,7 @@ def short_container_name(ctx, stack, container_name):
 @check("services", "health и рестарты контейнеров")
 def check_containers_health(ctx):
     for stack in ctx.stacks():
+        progress("health контейнеров: стек %s" % stack)
         containers = ctx.stack_containers(stack)
         healthy_count = 0
         has_problems = False
@@ -846,6 +851,7 @@ def check_service_tasks(ctx):
         for service in ctx.stack_services(stack):
             name = service.get("Name", "?")
             short_name = short_service_name(ctx, stack, name)
+            progress("упавшие задачи: %s" % short_name)
             try:
                 # истории задач немного (retention swarm), фильтруем по возрасту сами
                 tasks = docker_cli_json(
@@ -2540,9 +2546,11 @@ def check_logs(ctx):
     all_lines_scanned = 0
 
     for stack in ctx.stacks():
-        for service in ctx.stack_services(stack):
+        stack_services_list = ctx.stack_services(stack)
+        for service_number, service in enumerate(stack_services_list, start=1):
             name = service.get("Name", "?")
             short_name = short_service_name(ctx, stack, name)
+            progress("логи: %s (%d/%d)" % (short_name, service_number, len(stack_services_list)))
 
             rc, out, err = run_cmd(
                 ["docker", "service", "logs", "--since", args.since, "--tail", str(args.log_tail), name],
@@ -2693,7 +2701,38 @@ def check_backups(ctx):
 # ---ВЫВОД ОТЧЁТА---#
 
 # запустить одну проверку, перехватывая любые исключения
+# статус-строка прогресса: перерисовывается через \r; только в интерактивном терминале,
+# чтобы вывод в файл/pipe (tee, --json, CI) не замусоривался служебными строками
+PROGRESS_ENABLED = (not args.json) and sys.stdout.isatty()
+_progress = {"index": 0, "total": len(CHECKS), "start": time.time()}
+
+
+def progress(text, advance=False):
+    if not PROGRESS_ENABLED:
+        return
+    if advance:
+        _progress["index"] += 1
+    spinner = "|/-\\"[_progress["index"] % 4]
+    elapsed = int(time.time() - _progress["start"])
+    line = "  %s [%d/%d] %s (%d сек)" % (
+        spinner, _progress["index"], _progress["total"], text, elapsed)
+
+    width = shutil.get_terminal_size((100, 20)).columns
+    line = line[:max(width - 2, 20)].ljust(max(width - 2, 20))
+    sys.stdout.write("\r" + line)
+    sys.stdout.flush()
+
+
+def progress_clear():
+    if not PROGRESS_ENABLED:
+        return
+    width = shutil.get_terminal_size((100, 20)).columns
+    sys.stdout.write("\r" + " " * (width - 1) + "\r")
+    sys.stdout.flush()
+
+
 def run_check_safely(check_item, ctx):
+    progress("%s — %s" % (check_item["group"], check_item["name"]), advance=True)
     try:
         check_item["func"](ctx)
     except Exception:
@@ -2818,11 +2857,15 @@ def main():
         die("Неизвестные группы проверок: %s (доступны: %s)" % (
             ", ".join(unknown_groups), ", ".join(known_groups)))
 
-    for check_item in CHECKS:
-        if only_groups and check_item["group"] not in only_groups:
-            continue
+    planned_checks = [check_item for check_item in CHECKS
+                      if not only_groups or check_item["group"] in only_groups]
+    _progress["total"] = len(planned_checks)
+    _progress["start"] = time.time()
+
+    for check_item in planned_checks:
         run_check_safely(check_item, ctx)
 
+    progress_clear()
     if args.json:
         print(build_json_report(ctx))
     else:
